@@ -4,12 +4,72 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "lib/ryzenadj.h"
 #include "argparse.h"
 
 #define STRINGIFY2(X) #X
 #define STRINGIFY(X) STRINGIFY2(X)
+
+/*
+ * --set-coper can legitimately be passed once per core (up to 16 on
+ * current parts: 2 CCDs x 8 cores). argparse's OPT_U32 only ever
+ * writes into a single uint32_t, so passing --set-coper= multiple
+ * times on one command line just overwrites the same variable —
+ * only the last value parsed ever reaches the SMU.
+ *
+ * To fix that without touching argparse itself, we scan the raw
+ * argv for every --set-coper=<value> (or --set-coper <value>)
+ * occurrence BEFORE argparse_parse() runs, and collect them all
+ * here. argparse still parses --set-coper as before (for backward
+ * compatibility with existing single-value scripts/tooling), but
+ * the values applied at the end come from this list whenever it
+ * has more than one entry.
+ */
+#define MAX_COPER_VALUES 16
+
+static uint32_t coper_values[MAX_COPER_VALUES];
+static int coper_value_count = 0;
+
+/* Collects every --set-coper occurrence from argv into coper_values.
+ * Handles both --set-coper=VALUE and --set-coper VALUE forms. Silently
+ * stops collecting past MAX_COPER_VALUES (still lets argparse report
+ * the individual values normally; only the "apply all" step is capped). */
+static void collect_coper_values(int argc, const char **argv) {
+	const char *opt = "--set-coper";
+	size_t opt_len = strlen(opt);
+
+	for (int i = 1; i < argc; i++) {
+		const char *arg = argv[i];
+		if (strncmp(arg, opt, opt_len) != 0) {
+			continue;
+		}
+
+		const char *valstr = NULL;
+		if (arg[opt_len] == '=') {
+			valstr = arg + opt_len + 1;
+		} else if (arg[opt_len] == '\0' && i + 1 < argc) {
+			valstr = argv[i + 1];
+		} else {
+			continue; /* something like --set-coperxyz, not our flag */
+		}
+
+		char *end = NULL;
+		unsigned long v = strtoul(valstr, &end, 0);
+		if (end == valstr) {
+			continue; /* not a valid number, let argparse raise the error */
+		}
+
+		if (coper_value_count < MAX_COPER_VALUES) {
+			coper_values[coper_value_count++] = (uint32_t)v;
+		} else {
+			fprintf(stderr,
+				"Warning: more than %d --set-coper values given; ignoring extras beyond the first %d\n",
+				MAX_COPER_VALUES, MAX_COPER_VALUES);
+		}
+	}
+}
 
 #define _do_adjust(ARG) \
 do {                                                                              \
@@ -262,6 +322,10 @@ int main(int argc, const char **argv)
 	struct argparse argparse;
 	argparse_init(&argparse, options, usage, ARGPARSE_NON_OPTION_IS_INVALID);
 	argparse_describe(&argparse, "\n Ryzen Power Management adjust tool.", "\nWARNING: Use at your own risk!\nBy Jiaxun Yang <jiaxun.yang@flygoat.com>, Under LGPL.\nVersion: v" STRINGIFY(RYZENADJ_REVISION_VER) "." STRINGIFY(RYZENADJ_MAJOR_VER) "." STRINGIFY(RYZENADJ_MINIOR_VER));
+
+	/* Must run before argparse_parse(), which permutes argv in place. */
+	collect_coper_values(argc, argv);
+
 	argc = argparse_parse(&argparse, argc, argv);
 
 
@@ -326,7 +390,32 @@ int main(int argc, const char **argv)
 	_do_enable(enable_oc)
 	_do_enable(disable_oc);
 	_do_adjust(coall);
-	_do_adjust(coper);
+	if (coper_value_count > 1) {
+		for (int i = 0; i < coper_value_count; i++) {
+			uint32_t v = coper_values[i];
+			int adjerr = set_coper(ry, v);
+			if (!adjerr) {
+				any_adjust_applied = 1;
+				printf("Successfully set coper[%d] to %u\n", i, v);
+			} else if (adjerr == ADJ_ERR_FAM_UNSUPPORTED) {
+				printf("set_coper is not supported on this family\n");
+				err = -1;
+				break;
+			} else if (adjerr == ADJ_ERR_SMU_UNSUPPORTED) {
+				printf("set_coper is not supported on this SMU\n");
+				err = -1;
+				break;
+			} else if (adjerr == ADJ_ERR_SMU_REJECTED) {
+				printf("set_coper[%d] is rejected by SMU\n", i);
+				err = -1;
+			} else {
+				printf("Failed to set coper[%d]\n", i);
+				err = -1;
+			}
+		}
+	} else {
+		_do_adjust(coper);
+	}
 	_do_adjust(cogfx);
 
 	if (!err) {
