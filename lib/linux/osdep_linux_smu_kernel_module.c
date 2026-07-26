@@ -8,21 +8,91 @@
 
 #include "osdep_linux_smu_kernel_module.h"
 
-static uint32_t get_pm_table_size() {
-	const int fd = open("/sys/kernel/ryzen_smu_drv/pm_table_size", O_RDONLY);
+/*
+ * Read exactly `len` bytes, restarting on EINTR and on short reads.
+ * The sysfs binary attributes exposed by ryzen_smu are not guaranteed to be
+ * served in a single read(); the old code checked only for -1, so a short read
+ * left the tail of the PM table filled with stale/zero data and RyzenAdj
+ * happily reported it as telemetry.
+ */
+static int read_full(int fd, void *buf, size_t len)
+{
+	unsigned char *p = buf;
+	size_t done = 0;
+
+	while (done < len) {
+		const ssize_t n = read(fd, p + done, len - done);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+
+		if (n == 0) {
+			errno = EIO; /* short file */
+			return -1;
+		}
+
+		done += (size_t)n;
+	}
+
+	return 0;
+}
+
+static int write_full(int fd, const void *buf, size_t len)
+{
+	const unsigned char *p = buf;
+	size_t done = 0;
+
+	while (done < len) {
+		const ssize_t n = write(fd, p + done, len - done);
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+
+		done += (size_t)n;
+	}
+
+	return 0;
+}
+
+/*
+ * Returns 0 and stores the size on success, -1 on failure.
+ *
+ * The old signature returned uint32_t and used -1 as the error value, but the
+ * caller compared the result against -1 *after* storing it in a size_t field:
+ * (size_t)0xFFFFFFFF != (size_t)-1 on LP64, so the error branch was dead and a
+ * failed read produced a 4 GiB "table size".
+ */
+static int get_pm_table_size(size_t *out)
+{
+	const int fd = open("/sys/kernel/ryzen_smu_drv/pm_table_size", O_RDONLY | O_CLOEXEC);
 	uint32_t table_sz = 0;
 
-	if (fd == -1)
+	if (fd == -1) {
+		DBG("failed to open pm_table_size: %s\n", strerror(errno));
 		return -1;
+	}
 
-	if (read(fd, &table_sz, sizeof(table_sz)) == -1) {
+	if (read_full(fd, &table_sz, sizeof(table_sz)) != 0) {
 		DBG("failed to retrieve PM table size: %s\n", strerror(errno));
 		close(fd);
 		return -1;
 	}
 
 	close(fd);
-	return table_sz;
+
+	if (table_sz == 0 || table_sz > RYZENADJ_MAX_TABLE_SIZE) {
+		DBG("ryzen_smu reported implausible PM table size: %u\n", table_sz);
+		return -1;
+	}
+
+	*out = table_sz;
+	return 0;
 }
 
 os_access_obj_t *init_os_access_obj_kmod() {
@@ -32,18 +102,19 @@ os_access_obj_t *init_os_access_obj_kmod() {
 		return NULL;
 
 	memset(obj, 0, sizeof(os_access_obj_t));
+	obj->access.kmod.smn_fd = -1;
+	obj->access.kmod.pm_table_fd = -1;
 
-	obj->access.kmod.pm_table_size = get_pm_table_size();
-	if (obj->access.kmod.pm_table_size == -1)
+	if (get_pm_table_size(&obj->access.kmod.pm_table_size) != 0)
 		goto err_exit;
 
-	obj->access.kmod.smn_fd = open("/sys/kernel/ryzen_smu_drv/smn", O_RDWR);
+	obj->access.kmod.smn_fd = open("/sys/kernel/ryzen_smu_drv/smn", O_RDWR | O_CLOEXEC);
 	if (obj->access.kmod.smn_fd == -1) {
 		DBG("failed to open smn fd: %s\n", strerror(errno));
 		goto err_exit;
 	}
 
-	obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table", O_RDONLY);
+	obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table", O_RDONLY | O_CLOEXEC);
 	if (obj->access.kmod.pm_table_fd == -1) {
 		DBG("failed to open pm_table fd: %s\n", strerror(errno));
 		close(obj->access.kmod.smn_fd);
@@ -57,29 +128,43 @@ err_exit:
 	return NULL;
 }
 
-int init_mem_obj_kmod([[maybe_unused]] os_access_obj_t *os_access, [[maybe_unused]] const uintptr_t physAddr) {
+int init_mem_obj_kmod(RA_UNUSED os_access_obj_t *os_access, RA_UNUSED const uintptr_t physAddr,
+		      RA_UNUSED const size_t size) {
 	return 0;
 }
 
 void free_os_access_obj_kmod(os_access_obj_t *obj) {
-	close(obj->access.kmod.smn_fd);
-	close(obj->access.kmod.pm_table_fd);
+	if (obj == NULL)
+		return;
+
+	if (obj->access.kmod.smn_fd >= 0)
+		close(obj->access.kmod.smn_fd);
+
+	if (obj->access.kmod.pm_table_fd >= 0)
+		close(obj->access.kmod.pm_table_fd);
+
 	free(obj);
 }
 
 uint32_t smn_reg_read_kmod(const os_access_obj_t *obj, const uint32_t addr) {
 	uint32_t result = 0;
 
-	lseek(obj->access.kmod.smn_fd, 0, SEEK_SET);
+	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
+		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		return 0;
+	}
 
-	if (write(obj->access.kmod.smn_fd, &addr, sizeof(addr)) == -1) {
+	if (write_full(obj->access.kmod.smn_fd, &addr, sizeof(addr)) != 0) {
 		DBG("%s: write error: %s\n", __func__, strerror(errno));
 		return 0;
 	}
 
-	lseek(obj->access.kmod.smn_fd, 0, SEEK_SET);
+	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
+		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		return 0;
+	}
 
-	if (read(obj->access.kmod.smn_fd, &result, sizeof(result)) == -1) {
+	if (read_full(obj->access.kmod.smn_fd, &result, sizeof(result)) != 0) {
 		DBG("%s: read error: %s\n", __func__, strerror(errno));
 		return 0;
 	}
@@ -90,25 +175,31 @@ uint32_t smn_reg_read_kmod(const os_access_obj_t *obj, const uint32_t addr) {
 void smn_reg_write_kmod(const os_access_obj_t *obj, const uint32_t addr, const uint32_t data) {
 	const uint32_t write_buffer[2] = { addr, data };
 
-	lseek(obj->access.kmod.smn_fd, 0, SEEK_SET);
+	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
+		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		return;
+	}
 
-	if (write(obj->access.kmod.smn_fd, &write_buffer, sizeof(write_buffer)) == -1)
+	if (write_full(obj->access.kmod.smn_fd, write_buffer, sizeof(write_buffer)) != 0)
 		DBG("%s: error: %s\n", __func__, strerror(errno));
 }
 
 int copy_pm_table_kmod(const os_access_obj_t *obj, void *buffer, const size_t size) {
 	if (obj->access.kmod.pm_table_size < size) {
-		DBG("PM table size too small: ryzenadj (%zd) | ryzen_smu (%zd)\n", size, obj->access.kmod.pm_table_size);
+		DBG("PM table size too small: ryzenadj (%zu) | ryzen_smu (%zu)\n", size, obj->access.kmod.pm_table_size);
 		return -1;
 	}
 
 	if (obj->access.kmod.pm_table_size != size) {
-		DBG("PM table size mismatch (reading prefix): ryzenadj (%zd) | ryzen_smu (%zd)\n", size, obj->access.kmod.pm_table_size);
+		DBG("PM table size mismatch (reading prefix): ryzenadj (%zu) | ryzen_smu (%zu)\n", size, obj->access.kmod.pm_table_size);
 	}
 
-	lseek(obj->access.kmod.pm_table_fd, 0, SEEK_SET);
+	if (lseek(obj->access.kmod.pm_table_fd, 0, SEEK_SET) == (off_t)-1) {
+		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		return -1;
+	}
 
-	if (read(obj->access.kmod.pm_table_fd, buffer, size) == -1) {
+	if (read_full(obj->access.kmod.pm_table_fd, buffer, size) != 0) {
 		DBG("%s: error: %s\n", __func__, strerror(errno));
 		return -1;
 	}
@@ -116,7 +207,7 @@ int copy_pm_table_kmod(const os_access_obj_t *obj, void *buffer, const size_t si
 	return 0;
 }
 
-int compare_pm_table_kmod([[maybe_unused]] const void *buffer, [[maybe_unused]] size_t size) {
+int compare_pm_table_kmod(RA_UNUSED const void *buffer, RA_UNUSED size_t size) {
 	DBG("internal error: compare_pm_table() should never be called if ryzen_smu is loaded\n");
 	return -1;
 }

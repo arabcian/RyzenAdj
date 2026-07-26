@@ -1,0 +1,1587 @@
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -1,11 +1,16 @@
+ #cmake version
+-CMAKE_MINIMUM_REQUIRED(VERSION 3.10)
++CMAKE_MINIMUM_REQUIRED(VERSION 3.13)
+ 
+ #define project name
+-PROJECT(ryzenadj)
++PROJECT(ryzenadj C CXX)
+ 
+ include(GNUInstallDirs)
++include(CheckCCompilerFlag)
+ 
++# The sources no longer use C23 [[attribute]] syntax, so a plain C11 baseline
++# is enough and keeps older toolchains working.
++set(CMAKE_C_STANDARD 11)
++set(CMAKE_C_STANDARD_REQUIRED ON)
+ set(CMAKE_C_VISIBILITY_PRESET hidden)
+ 
+ set(CMAKE_CXX_STANDARD 11)
+@@ -13,9 +18,61 @@
+ 
+ option(BUILD_SHARED_LIBS "Build using shared libraries" ON)
+ option(PREFER_STATIC_LINKING "Prefer static linking for the ryzenadj executable" OFF)
++option(RYZENADJ_HARDENING "Enable compiler/linker hardening for this root-privileged tool" ON)
++
++# LTO with no optimisation level is a pointless combination, and
++# _FORTIFY_SOURCE silently does nothing without -O. Default to Release when
++# neither the user nor the distro build system picked something.
++if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
++    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
++endif()
+ 
+ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+ 
++# ---------------------------------------------------------------------------
++# Hardening
++#
++# ryzenadj runs as root and pokes the SMU through PCI config space and
++# /dev/mem, so it is exactly the kind of binary that should carry the full set
++# of mitigations. Everything below is *appended* via add_compile_options() /
++# add_link_options() instead of being assigned to CMAKE_C_FLAGS, so distro
++# flags (Gentoo make.conf, dpkg-buildflags, ...) are preserved rather than
++# overwritten - and, unlike a Makefile `?=`, an environment-supplied CFLAGS
++# cannot silently delete them.
++# ---------------------------------------------------------------------------
++function(ryzenadj_try_add_flag flag)
++    string(MAKE_C_IDENTIFIER "HAVE_FLAG${flag}" varname)
++    check_c_compiler_flag("${flag}" ${varname})
++    if(${varname})
++        add_compile_options(${flag})
++    endif()
++endfunction()
++
++# Warnings: these caught several of the defects fixed in this tree (a dead
++# error check, sign-compare bugs, format/varargs mismatches). Keep them on.
++foreach(warn -Wall -Wextra -Wformat=2 -Wno-missing-field-initializers)
++    ryzenadj_try_add_flag(${warn})
++endforeach()
++
++if(RYZENADJ_HARDENING AND NOT MSVC)
++    # This code type-puns its way around MMIO and PM-table buffers. Combined
++    # with the LTO enabled below, strict aliasing is a realistic
++    # miscompilation risk here for very little performance upside.
++    ryzenadj_try_add_flag(-fno-strict-aliasing)
++
++    ryzenadj_try_add_flag(-fstack-protector-strong)
++    ryzenadj_try_add_flag(-fstack-clash-protection)
++    ryzenadj_try_add_flag(-fcf-protection=full)
++
++    # _FORTIFY_SOURCE needs optimisation; skip it for Debug builds where it
++    # would only produce a "requires -O" warning.
++    add_compile_definitions($<$<NOT:$<CONFIG:Debug>>:_FORTIFY_SOURCE=2>)
++
++    if(NOT WIN32 AND NOT APPLE)
++        add_link_options(-Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
++    endif()
++endif()
++
+ #Enable LTO
+ include(CheckIPOSupported)
+ check_ipo_supported(RESULT supported OUTPUT error)
+@@ -59,6 +116,15 @@
+ add_definitions(-D_LIBRYZENADJ_INTERNAL)
+ 
+ ADD_EXECUTABLE(${PROJECT_NAME} ${OS_SOURCE} ${COMMON_SOURCES} argparse.c main.c)
++
++# A fully static binary cannot be a PIE, so only ask for PIE otherwise.
++if(RYZENADJ_HARDENING AND NOT PREFER_STATIC_LINKING)
++    set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
++    if(NOT WIN32 AND NOT APPLE)
++        set_property(TARGET ${PROJECT_NAME} APPEND_STRING PROPERTY LINK_FLAGS " -pie")
++    endif()
++endif()
++
+ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (PREFER_STATIC_LINKING OR NOT BUILD_SHARED_LIBS))
+     if(PREFER_STATIC_LINKING)
+         set_property(TARGET ${PROJECT_NAME} APPEND_STRING PROPERTY LINK_FLAGS " -static")
+@@ -70,6 +136,7 @@
+ #SET_TARGET_PROPERTIES(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE C)
+ ADD_LIBRARY (libryzenadj ${OS_SOURCE} ${COMMON_SOURCES})
+ set_target_properties(libryzenadj PROPERTIES PREFIX "")
++set_property(TARGET libryzenadj PROPERTY POSITION_INDEPENDENT_CODE ON)
+ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+     target_link_libraries(libryzenadj ${OS_STATIC_LINK_LIBRARY})
+ else()
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -10,6 +10,9 @@
+ #include <string.h>
+ #include <assert.h>
+ #include <errno.h>
++#include <limits.h>
++#include <ctype.h>
++#include <stdint.h>
+ #include "argparse.h"
+ 
+ #define OPT_UNSET 1
+@@ -33,6 +36,32 @@
+ 		}
+ }
+ 
++/*
++ * Portable strerror wrapper.
++ *
++ * The old code called strerror_r() and then printed `buf` while ignoring the
++ * return value. That is only correct for the XSI variant; when the translation
++ * unit is built with _GNU_SOURCE (which several distro toolchains and any
++ * `-std=gnu*` + feature-test combination can pull in) glibc provides the GNU
++ * variant, which may leave `buf` untouched and return a pointer to a static
++ * string - so the user got an empty error message.
++ */
++static const char *
++safe_strerror(int err, char *buf, size_t buflen)
++{
++	buf[0] = '\0';
++#ifdef _WIN32
++	strerror_s(buf, buflen, err);
++	return buf;
++#elif defined(__GLIBC__) && defined(_GNU_SOURCE)
++	return strerror_r(err, buf, buflen);
++#else
++	if (strerror_r(err, buf, buflen) != 0)
++		snprintf(buf, buflen, "errno %d", err);
++	return buf;
++#endif
++}
++
+ static void
+ argparse_error(struct argparse *self, const struct argparse_option *opt,
+ 			   const char *reason, int flags)
+@@ -52,8 +81,8 @@
+ {
+ 	const char *s = NULL;
+ 	char buf[256];
++
+ 	buf[0] = 0;
+-	char *pbuf = buf;
+ 
+ 	if (!opt->value)
+ 		goto skipped;
+@@ -86,72 +115,105 @@
+ 			argparse_error(self, opt, "requires a value", flags);
+ 		}
+ 		break;
+-	case ARGPARSE_OPT_INTEGER:
+-		errno = 0;
++	case ARGPARSE_OPT_INTEGER: {
++		const char *raw = NULL;
++		long lval;
++
+ 		if (self->optvalue) {
+-			*(int *)opt->value = strtol(self->optvalue, (char **)&s, 0);
+-			self->optvalue     = NULL;
++			raw = self->optvalue;
++			self->optvalue = NULL;
+ 		} else if (self->argc > 1) {
+ 			self->argc--;
+-			*(int *)opt->value = strtol(*++self->argv, (char **)&s, 0);
++			raw = *++self->argv;
+ 		} else {
+ 			argparse_error(self, opt, "requires a value", flags);
+ 		}
+-		if (errno){
+-			#ifdef _WIN32
+-			strerror_s(buf, sizeof(buf), errno);
+-			#else
+-			strerror_r(errno, buf, sizeof(buf));
+-			#endif
+-			argparse_error(self, opt, pbuf, flags);
+-		}
+-		if (s[0] != '\0')
++
++		if (raw == NULL || raw[0] == '\0')
++			argparse_error(self, opt, "requires a value", flags);
++
++		errno = 0;
++		lval = strtol(raw, (char **)&s, 0);
++		if (errno)
++			argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
++		if (s == raw || s[0] != '\0')
+ 			argparse_error(self, opt, "expects an integer value", flags);
++		if (lval < INT_MIN || lval > INT_MAX)
++			argparse_error(self, opt, "value is out of range for a 32-bit signed integer", flags);
++
++		*(int *)opt->value = (int)lval;
+ 		break;
+-	case ARGPARSE_OPT_U32:
+-		errno = 0;
++	}
++	case ARGPARSE_OPT_U32: {
++		const char *raw = NULL;
++		const char *scan;
++		unsigned long uval;
++
+ 		if (self->optvalue) {
+-			*(uint32_t *)opt->value = strtoul(self->optvalue, (char **)&s, 0);
+-			self->optvalue     = NULL;
++			raw = self->optvalue;
++			self->optvalue = NULL;
+ 		} else if (self->argc > 1) {
+ 			self->argc--;
+-			*(uint32_t *)opt->value = strtoul(*++self->argv, (char **)&s, 0);
++			raw = *++self->argv;
+ 		} else {
+ 			argparse_error(self, opt, "requires a value", flags);
+ 		}
+-		if (errno){
+-			#ifdef _WIN32
+-			strerror_s(buf, sizeof(buf), errno);
+-			#else
+-			strerror_r(errno, buf, sizeof(buf));
+-			#endif
+-			argparse_error(self, opt, pbuf, flags);
+-		}
+-		if (s[0] != '\0')
++
++		if (raw == NULL || raw[0] == '\0')
++			argparse_error(self, opt, "requires a value", flags);
++
++		/*
++		 * strtoul() cheerfully wraps negative input: "-1" became 0xFFFFFFFF,
++		 * which is exactly the sentinel RyzenAdj uses for "option not given",
++		 * and "-5" became 4294967291 - a value that was then handed straight
++		 * to the SMU as a power/current limit. Reject signs outright.
++		 */
++		scan = raw;
++		while (isspace((unsigned char)*scan))
++			scan++;
++		if (*scan == '-' || *scan == '+')
++			argparse_error(self, opt, "expects a non-negative value", flags);
++
++		errno = 0;
++		uval = strtoul(raw, (char **)&s, 0);
++		if (errno)
++			argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
++		if (s == raw || s[0] != '\0')
+ 			argparse_error(self, opt, "expects an unsigned 32-bit integer value", flags);
++		/* on LP64 strtoul returns 64 bit; the assignment used to truncate silently */
++		if (uval > UINT32_MAX)
++			argparse_error(self, opt, "value is out of range for a 32-bit unsigned integer", flags);
++
++		*(uint32_t *)opt->value = (uint32_t)uval;
+ 		break;
+-	case ARGPARSE_OPT_FLOAT:
+-		errno = 0;
++	}
++	case ARGPARSE_OPT_FLOAT: {
++		const char *raw = NULL;
++		float fval;
++
+ 		if (self->optvalue) {
+-			*(float *)opt->value = strtof(self->optvalue, (char **)&s);
+-			self->optvalue       = NULL;
++			raw = self->optvalue;
++			self->optvalue = NULL;
+ 		} else if (self->argc > 1) {
+ 			self->argc--;
+-			*(float *)opt->value = strtof(*++self->argv, (char **)&s);
++			raw = *++self->argv;
+ 		} else {
+ 			argparse_error(self, opt, "requires a value", flags);
+ 		}
+-		if (errno){
+-			#ifdef _WIN32
+-			strerror_s(buf, sizeof(buf), errno);
+-			#else
+-			strerror_r(errno, buf, sizeof(buf));
+-			#endif
+-			argparse_error(self, opt, pbuf, flags);
+-		}
+-		if (s[0] != '\0')
++
++		if (raw == NULL || raw[0] == '\0')
++			argparse_error(self, opt, "requires a value", flags);
++
++		errno = 0;
++		fval = strtof(raw, (char **)&s);
++		if (errno)
++			argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
++		if (s == raw || s[0] != '\0')
+ 			argparse_error(self, opt, "expects a numerical value", flags);
++
++		*(float *)opt->value = fval;
+ 		break;
++	}
+ 	default:
+ 		assert(0);
+ 	}
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -36,7 +36,8 @@
+ 
+ 	ry->os_access = init_os_access_obj();
+ 	if(!ry->os_access){
+-		printf("Unable to get os_access Obj, check permission\n");
++		printf("Unable to get os_access Obj, check permission (RyzenAdj needs to run as root)\n");
++		free(ry);
+ 		return NULL;
+ 	}
+ 
+@@ -72,11 +73,17 @@
+ 
+ EXP enum ryzen_family get_cpu_family(ryzen_access ry)
+ {
++	if (!ry)
++		return FAM_UNKNOWN;
++
+ 	return ry->family;
+ }
+ 
+ EXP int get_bios_if_ver(ryzen_access ry)
+ {
++	if(!ry)
++		return 0;
++
+ 	if(ry->bios_if_ver)
+ 		return ry->bios_if_ver;
+ 
+@@ -88,7 +95,10 @@
+ 
+ #define _return_translated_smu_error(SMU_RESP)                              \
+ do {                                                                        \
+-	if (SMU_RESP == REP_MSG_UnknownCmd) {                                   \
++	if (SMU_RESP == REP_MSG_Timeout) {                                      \
++		printf("%s timed out waiting for the SMU\n", __func__);           \
++		return ADJ_ERR_SMU_TIMEOUT;                                         \
++	} else if (SMU_RESP == REP_MSG_UnknownCmd) {                            \
+ 		printf("%s is unsupported\n", __func__);                            \
+ 		return ADJ_ERR_SMU_UNSUPPORTED;                                     \
+ 	} else if (SMU_RESP == REP_MSG_CmdRejectedPrereq){                      \
+@@ -287,11 +297,34 @@
+ 	return 0;
+ }
+ 
++static int init_table_locked(ryzen_access ry);
++
+ EXP int CALL init_table(ryzen_access ry)
+ {
+ 	DBG("init_table\n");
+ 	int errorcode = 0;
+ 
++	if (!ry)
++		return ADJ_ERR_MEMORY_ACCESS;
++
++	/*
++	 * init_table() is reachable both directly and from _lazy_init_table(),
++	 * which refresh_table() also uses. Without this guard an allocation
++	 * failure below sent the pair into unbounded mutual recursion.
++	 */
++	if (ry->table_init_busy)
++		return ADJ_ERR_MEMORY_ACCESS;
++	ry->table_init_busy = 1;
++
++	errorcode = init_table_locked(ry);
++	ry->table_init_busy = 0;
++	return errorcode;
++}
++
++static int init_table_locked(ryzen_access ry)
++{
++	int errorcode = 0;
++
+ 	errorcode = request_table_ver_and_size(ry);
+ 	if(errorcode){
+ 		return errorcode;
+@@ -302,8 +335,15 @@
+ 		return errorcode;
+ 	}
+ 
++	//reject an implausible size before it is used to size an allocation or a mapping
++	if (ry->table_size == 0 || ry->table_size % 4 != 0 || ry->table_size > RYZENADJ_MAX_TABLE_SIZE) {
++		printf("Refusing implausible PM table size 0x%zx (table version %x)\n",
++		       ry->table_size, ry->table_ver);
++		return ADJ_ERR_MEMORY_ACCESS;
++	}
++
+ 	//init memory object because it is prerequiremt to woring with physical memory address
+-	if (init_mem_obj(ry->os_access, ry->table_addr) < 0) {
++	if (init_mem_obj(ry->os_access, ry->table_addr, ry->table_size) < 0) {
+ 		printf("Unable to get memory access\n");
+ 		return ADJ_ERR_MEMORY_ACCESS;
+ 	}
+@@ -313,7 +353,10 @@
+ 	//especially for unknown table versions that fall back to the 0x1000 sentinel
+ #ifndef _WIN32
+ 	if (is_using_smu_driver() &&
+-	    ry->os_access->access.kmod.pm_table_size != ry->table_size) {
++	    ry->os_access->access.kmod.pm_table_size != ry->table_size &&
++	    ry->os_access->access.kmod.pm_table_size != 0 &&
++	    ry->os_access->access.kmod.pm_table_size % 4 == 0 &&
++	    ry->os_access->access.kmod.pm_table_size <= RYZENADJ_MAX_TABLE_SIZE) {
+ 		DBG("PM table size: using kmod value (%zu) over SMU-derived value (%zu)\n",
+ 		    ry->os_access->access.kmod.pm_table_size, ry->table_size);
+ 		ry->table_size = ry->os_access->access.kmod.pm_table_size;
+@@ -321,7 +364,13 @@
+ #endif
+ 
+ 	//hold copy of table value in memory for our single value getters
++	//re-initialisation must not leak the previous buffer
++	free(ry->table_values);
+ 	ry->table_values = calloc(ry->table_size / 4, 4);
++	if (!ry->table_values) {
++		printf("Out of memory while allocating the power metric table\n");
++		return ADJ_ERR_MEMORY_ACCESS;
++	}
+ 
+ 	errorcode = refresh_table(ry);
+ 	if(errorcode)
+@@ -370,12 +419,19 @@
+ 
+ EXP float* CALL get_table_values(ryzen_access ry)
+ {
++	if (!ry)
++		return NULL;
++
+ 	return ry->table_values;
+ }
+ 
+ EXP int CALL refresh_table(ryzen_access ry)
+ {
+ 	int errorcode = 0;
++
++	if (!ry)
++		return ADJ_ERR_MEMORY_ACCESS;
++
+ 	_lazy_init_table(errorcode);
+ 
+ 	//only execute request table if we don't use SMU driver
+@@ -410,6 +466,8 @@
+ 	resp = smu_service_req(ry->mp1_smu, OPT, &args); \
+ 	if (resp == REP_MSG_OK) {                        \
+ 		err = 0;                                     \
++	} else if (resp == REP_MSG_Timeout) {            \
++		err = ADJ_ERR_SMU_TIMEOUT;                   \
+ 	} else if (resp == REP_MSG_UnknownCmd) {         \
+ 		err = ADJ_ERR_SMU_UNSUPPORTED;               \
+ 	} else {                                         \
+@@ -426,6 +484,8 @@
+ 	resp = smu_service_req(ry->psmu, OPT, &args);    \
+ 	if (resp == REP_MSG_OK) {                        \
+ 		err = 0;                                     \
++	} else if (resp == REP_MSG_Timeout) {            \
++		err = ADJ_ERR_SMU_TIMEOUT;                   \
+ 	} else if (resp == REP_MSG_UnknownCmd) {         \
+ 		err = ADJ_ERR_SMU_UNSUPPORTED;               \
+ 	} else {                                         \
+@@ -433,11 +493,24 @@
+ 	}                                                \
+ } while (0);
+ 
+-#define _read_float_value(OFFSET)                    \
+-do {                                                 \
+-	if(!ry->table_values)                            \
+-		return NAN;                                  \
+-	return ry->table_values[(OFFSET) / 4];           \
++/*
++ * Every single-value getter goes through here. The offsets are keyed off the
++ * PM table version reported by the SMU, while table_size can come from a
++ * different source (the ryzen_smu module, or the 0x1000 fallback used for
++ * unknown table versions). When the two disagree the old macro happily read
++ * past the end of the heap buffer. Bound every access instead.
++ */
++#define _read_float_value(OFFSET)                                        \
++do {                                                                     \
++	const size_t _off = (size_t)(OFFSET);                                \
++	if(!ry->table_values)                                                \
++		return NAN;                                                      \
++	if(_off + sizeof(float) > ry->table_size) {                          \
++		DBG("%s: offset 0x%zx out of range for table size 0x%zx\n",      \
++		    __func__, _off, ry->table_size);                             \
++		return NAN;                                                      \
++	}                                                                    \
++	return ry->table_values[_off / 4];                                   \
+ } while (0);
+ 
+ 
+@@ -607,10 +680,19 @@
+ 	case FAM_KRACKANPOINT:
+ 	case FAM_STRIXPOINT:
+ 	case FAM_STRIXHALO:
++		/*
++		 * Missing break: on every family in the group above, RyzenAdj sent
++		 * SMU message 0x18 (the correct STAPM time message) and then fell
++		 * through and *also* sent 0x4e - the Dragon Range / Fire Range
++		 * message ID - to the same MP1 mailbox, overwriting err with the
++		 * result of a command that was never meant for this silicon.
++		 */
+ 		_do_adjust(0x18);
++		break;
+ 	case FAM_DRAGONRANGE:
+ 	case FAM_FIRERANGE:
+ 		_do_adjust(0x4e);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -1460,6 +1542,7 @@
+ 		break;
+ 	case FAM_STRIXHALO:
+ 		// 0xB7 is rejected on this architecture
++		break;
+ 	default:
+ 		break;
+ 	}
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -29,16 +29,22 @@
+ {
+     uint32_t regs[4];
+     int family, model;
+-    char vendor[4 * 4];
++    char vendor[13];
+ 
+     getcpuid(regs, 0);
+ 
+-    /* Hack Alert! Put into str buffer */
+-    *(uint32_t *) &vendor[0] = regs[1];
+-    *(uint32_t *) &vendor[4] = regs[3];
+-    *(uint32_t *) &vendor[8] = regs[2];
++    /*
++     * memcpy instead of type-punning through a char* cast: the old
++     * `*(uint32_t *)&vendor[0] = ...` form violates strict aliasing and can be
++     * miscompiled under -O2 with LTO (which this project enables by default).
++     * Also NUL-terminate so the buffer is a real string.
++     */
++    memcpy(&vendor[0], &regs[1], 4);
++    memcpy(&vendor[4], &regs[3], 4);
++    memcpy(&vendor[8], &regs[2], 4);
++    vendor[12] = '\0';
+ 
+-    if (strncmp(vendor, CPUID_VENDOR_AMD, strlen(CPUID_VENDOR_AMD))) {
++    if (strcmp(vendor, CPUID_VENDOR_AMD)) {
+         printf("Not AMD processor, must be kidding\n");
+         return FAM_UNKNOWN;
+     }
+@@ -106,6 +112,7 @@
+             printf("Fam%xh: unsupported model %d\n", family, model);
+             break;
+         }
++        break;
+ 
+     default:
+         printf("Unsupported family: %xh\n", family);
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -5,7 +5,7 @@
+ #include "osdep_linux_mem.h"
+ #include "osdep_linux_smu_kernel_module.h"
+ 
+-bool is_smu = false;
++static bool is_smu = false;
+ 
+ static bool is_ryzen_smu_driver_compatible() {
+ 	FILE *drv_ver = fopen("/sys/kernel/ryzen_smu_drv/drv_version", "r");
+@@ -16,7 +16,7 @@
+ 		return false;
+ 	}
+ 
+-	ret = fscanf(drv_ver, "%d.%d.%d", &major, &minor, &patch);
++	ret = fscanf(drv_ver, "%9d.%9d.%9d", &major, &minor, &patch);
+ 	if (ret == EOF || ret < 3) {
+ 		DBG("failed to parse ryzen_smu version string\n");
+ 		fclose(drv_ver);
+@@ -45,14 +45,19 @@
+ 	return init_os_access_obj_mem();
+ }
+ 
+-int init_mem_obj(os_access_obj_t *os_access, const uintptr_t physAddr) {
++int init_mem_obj(os_access_obj_t *os_access, const uintptr_t physAddr, const size_t size) {
+ 	if (is_smu)
+-		return init_mem_obj_kmod(os_access, physAddr);
++		return init_mem_obj_kmod(os_access, physAddr, size);
+ 
+-	return init_mem_obj_mem(os_access, physAddr);
++	return init_mem_obj_mem(os_access, physAddr, size);
+ }
+ 
+ void free_os_access_obj(os_access_obj_t *obj) {
++	if (obj == NULL) {
++		is_smu = false;
++		return;
++	}
++
+ 	if (is_smu)
+ 		free_os_access_obj_kmod(obj);
+ 	else
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -7,10 +7,58 @@
+ #include <unistd.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <errno.h>
+ 
+ #include "osdep_linux_mem.h"
+ 
+-void *phy_map = MAP_FAILED;
++/*
++ * State of the /dev/mem window onto the PM table.
++ *
++ * These used to be a single non-static `void *phy_map`, which (a) was an
++ * exported symbol of libryzenadj and (b) silently leaked the previous mapping
++ * whenever init_mem_obj_mem() ran twice (init_table() can be re-entered
++ * through the lazy-init path). We now keep the base, the mapped length and
++ * the offset of the table inside the page, and unmap before remapping.
++ */
++static void *phy_map = MAP_FAILED;   /* page-aligned mapping base */
++static size_t phy_map_len;           /* bytes actually mapped */
++static size_t phy_map_offset;        /* offset of the table within the mapping */
++
++static size_t page_size(void)
++{
++	const long sz = sysconf(_SC_PAGESIZE);
++
++	return sz > 0 ? (size_t)sz : 4096u;
++}
++
++static void unmap_phy(void)
++{
++	if (phy_map != MAP_FAILED) {
++		munmap(phy_map, phy_map_len);
++		phy_map = MAP_FAILED;
++	}
++
++	phy_map_len = 0;
++	phy_map_offset = 0;
++}
++
++/* Pointer to the start of the PM table inside the mapping, or NULL. */
++static const void *phy_table_ptr(void)
++{
++	if (phy_map == MAP_FAILED)
++		return NULL;
++
++	return (const unsigned char *)phy_map + phy_map_offset;
++}
++
++/* How many bytes of table are actually readable through the mapping. */
++static size_t phy_table_avail(void)
++{
++	if (phy_map == MAP_FAILED || phy_map_offset > phy_map_len)
++		return 0;
++
++	return phy_map_len - phy_map_offset;
++}
+ 
+ os_access_obj_t *init_os_access_obj_mem() {
+ 	os_access_obj_t *obj = malloc(sizeof(os_access_obj_t));
+@@ -32,6 +80,7 @@
+ 	if (!obj->access.mem.pci_dev) {
+ 		fprintf(stderr, "Unable to get pci device\n");
+ 		pci_cleanup(obj->access.mem.pci_acc);
++		obj->access.mem.pci_acc = NULL;
+ 		goto err_exit;
+ 	}
+ 
+@@ -43,19 +92,53 @@
+ 	return NULL;
+ }
+ 
+-int init_mem_obj_mem([[maybe_unused]] os_access_obj_t *os_access, const uintptr_t physAddr) {
+-	const int dev_mem_fd = open("/dev/mem", O_RDONLY);
++/*
++ * Map the physical PM table window.
++ *
++ * Fixes over the previous version:
++ *  - `fd > 0` rejected a perfectly valid fd 0 (possible when stdin is closed).
++ *  - the offset was cast to `long` and passed unaligned; mmap() requires a
++ *    page-aligned offset, so any non-page-aligned table address failed with
++ *    EINVAL instead of being handled.
++ *  - the mapping was always exactly 0x1000 bytes even though the caller may
++ *    copy more than that out of it (see copy_pm_table_mem).
++ *  - O_CLOEXEC was missing.
++ */
++int init_mem_obj_mem(RA_UNUSED os_access_obj_t *os_access, const uintptr_t physAddr, const size_t size) {
++	const size_t pgsz = page_size();
++	const off_t aligned = (off_t)(physAddr & ~(uintptr_t)(pgsz - 1));
++	const size_t offset = (size_t)(physAddr - (uintptr_t)aligned);
++	const size_t want = (size && size <= RYZENADJ_MAX_TABLE_SIZE) ? size : RYZENADJ_MAX_TABLE_SIZE;
++	const size_t len = ((offset + want + pgsz - 1) / pgsz) * pgsz;
++	int dev_mem_fd;
++
++	/* a fresh mapping replaces any previous one instead of leaking it */
++	unmap_phy();
+ 
+ 	// It is too complicated to check PAT, CONFIG_NONPROMISC_DEVMEM, CONFIG_STRICT_DEVMEM or other dependencies, just try to open /dev/mem
+-	if (dev_mem_fd > 0) {
+-		phy_map = mmap(NULL, 0x1000, PROT_READ, MAP_SHARED, dev_mem_fd, (long)physAddr);
+-		close(dev_mem_fd);
++	dev_mem_fd = open("/dev/mem", O_RDONLY | O_CLOEXEC);
++	if (dev_mem_fd < 0) {
++		DBG("failed to open /dev/mem: %s\n", strerror(errno));
++		return -1;
++	}
++
++	phy_map = mmap(NULL, len, PROT_READ, MAP_SHARED, dev_mem_fd, aligned);
++	close(dev_mem_fd);
++
++	if (phy_map == MAP_FAILED) {
++		DBG("failed to mmap /dev/mem at 0x%llx: %s\n",
++		    (unsigned long long)aligned, strerror(errno));
++		return -1;
+ 	}
+ 
+-	return phy_map == MAP_FAILED ? -1 : 0;
++	phy_map_len = len;
++	phy_map_offset = offset;
++	return 0;
+ }
+ 
+ void free_os_access_obj_mem(os_access_obj_t *obj) {
++	unmap_phy();
++
+ 	if (obj == NULL)
+ 		return;
+ 
+@@ -65,16 +148,11 @@
+ 	if (obj->access.mem.pci_acc)
+ 		pci_cleanup(obj->access.mem.pci_acc);
+ 
+-	if (phy_map != MAP_FAILED) {
+-		munmap(phy_map, 0x1000);
+-		phy_map = MAP_FAILED;
+-	}
+-
+ 	free(obj);
+ }
+ 
+ uint32_t smn_reg_read_mem(const os_access_obj_t *obj, const uint32_t addr) {
+-	pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_ADDR_ADDR, addr & (~0x3));
++	pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_ADDR_ADDR, addr & ~(uint32_t)0x3);
+ 	return pci_read_long(obj->access.mem.pci_dev, NB_PCI_REG_DATA_ADDR);
+ }
+ 
+@@ -83,16 +161,39 @@
+ 	pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_DATA_ADDR, data);
+ }
+ 
+-int copy_pm_table_mem([[maybe_unused]] const os_access_obj_t *obj, void *buffer, const size_t size) {
+-	if (phy_map != MAP_FAILED) {
+-		memcpy(buffer, phy_map, size);
+-		return 0;
++int copy_pm_table_mem(RA_UNUSED const os_access_obj_t *obj, void *buffer, const size_t size) {
++	const void *src = phy_table_ptr();
++
++	if (src == NULL) {
++		DBG("failed to get pm_table from /dev/mem\n");
++		return -1;
+ 	}
+ 
+-	DBG("failed to get pm_table from /dev/mem\n");
+-	return -1;
++	/*
++	 * Never read past the end of the mapping. Previously this copied `size`
++	 * bytes unconditionally out of a fixed 0x1000 window, so any table larger
++	 * than one page walked off the mapping and took the process down.
++	 */
++	if (size > phy_table_avail()) {
++		DBG("pm_table read of %zu bytes exceeds mapped window of %zu bytes\n",
++		    size, phy_table_avail());
++		return -1;
++	}
++
++	memcpy(buffer, src, size);
++	return 0;
+ }
+ 
+ int compare_pm_table_mem(const void *buffer, const size_t size) {
+-	return memcmp(buffer, phy_map, size);
++	const void *src = phy_table_ptr();
++
++	/*
++	 * The old version dereferenced phy_map unconditionally, so a compare
++	 * before a successful mmap dereferenced MAP_FAILED ((void *)-1).
++	 * Report "different" when we cannot read, so the caller re-transfers.
++	 */
++	if (src == NULL || size > phy_table_avail())
++		return -1;
++
++	return memcmp(buffer, src, size);
+ }
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -6,7 +6,7 @@
+ #include "../nb_smu_ops.h"
+ 
+ os_access_obj_t *init_os_access_obj_mem();
+-int init_mem_obj_mem(os_access_obj_t *os_access, uintptr_t physAddr);
++int init_mem_obj_mem(os_access_obj_t *os_access, uintptr_t physAddr, size_t size);
+ int copy_pm_table_mem(const os_access_obj_t *obj, void *buffer, size_t size);
+ int compare_pm_table_mem(const void *buffer, size_t size);
+ void free_os_access_obj_mem(os_access_obj_t *obj);
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -8,21 +8,91 @@
+ 
+ #include "osdep_linux_smu_kernel_module.h"
+ 
+-static uint32_t get_pm_table_size() {
+-	const int fd = open("/sys/kernel/ryzen_smu_drv/pm_table_size", O_RDONLY);
++/*
++ * Read exactly `len` bytes, restarting on EINTR and on short reads.
++ * The sysfs binary attributes exposed by ryzen_smu are not guaranteed to be
++ * served in a single read(); the old code checked only for -1, so a short read
++ * left the tail of the PM table filled with stale/zero data and RyzenAdj
++ * happily reported it as telemetry.
++ */
++static int read_full(int fd, void *buf, size_t len)
++{
++	unsigned char *p = buf;
++	size_t done = 0;
++
++	while (done < len) {
++		const ssize_t n = read(fd, p + done, len - done);
++
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++
++		if (n == 0) {
++			errno = EIO; /* short file */
++			return -1;
++		}
++
++		done += (size_t)n;
++	}
++
++	return 0;
++}
++
++static int write_full(int fd, const void *buf, size_t len)
++{
++	const unsigned char *p = buf;
++	size_t done = 0;
++
++	while (done < len) {
++		const ssize_t n = write(fd, p + done, len - done);
++
++		if (n < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++
++		done += (size_t)n;
++	}
++
++	return 0;
++}
++
++/*
++ * Returns 0 and stores the size on success, -1 on failure.
++ *
++ * The old signature returned uint32_t and used -1 as the error value, but the
++ * caller compared the result against -1 *after* storing it in a size_t field:
++ * (size_t)0xFFFFFFFF != (size_t)-1 on LP64, so the error branch was dead and a
++ * failed read produced a 4 GiB "table size".
++ */
++static int get_pm_table_size(size_t *out)
++{
++	const int fd = open("/sys/kernel/ryzen_smu_drv/pm_table_size", O_RDONLY | O_CLOEXEC);
+ 	uint32_t table_sz = 0;
+ 
+-	if (fd == -1)
++	if (fd == -1) {
++		DBG("failed to open pm_table_size: %s\n", strerror(errno));
+ 		return -1;
++	}
+ 
+-	if (read(fd, &table_sz, sizeof(table_sz)) == -1) {
++	if (read_full(fd, &table_sz, sizeof(table_sz)) != 0) {
+ 		DBG("failed to retrieve PM table size: %s\n", strerror(errno));
+ 		close(fd);
+ 		return -1;
+ 	}
+ 
+ 	close(fd);
+-	return table_sz;
++
++	if (table_sz == 0 || table_sz > RYZENADJ_MAX_TABLE_SIZE) {
++		DBG("ryzen_smu reported implausible PM table size: %u\n", table_sz);
++		return -1;
++	}
++
++	*out = table_sz;
++	return 0;
+ }
+ 
+ os_access_obj_t *init_os_access_obj_kmod() {
+@@ -32,18 +102,19 @@
+ 		return NULL;
+ 
+ 	memset(obj, 0, sizeof(os_access_obj_t));
++	obj->access.kmod.smn_fd = -1;
++	obj->access.kmod.pm_table_fd = -1;
+ 
+-	obj->access.kmod.pm_table_size = get_pm_table_size();
+-	if (obj->access.kmod.pm_table_size == -1)
++	if (get_pm_table_size(&obj->access.kmod.pm_table_size) != 0)
+ 		goto err_exit;
+ 
+-	obj->access.kmod.smn_fd = open("/sys/kernel/ryzen_smu_drv/smn", O_RDWR);
++	obj->access.kmod.smn_fd = open("/sys/kernel/ryzen_smu_drv/smn", O_RDWR | O_CLOEXEC);
+ 	if (obj->access.kmod.smn_fd == -1) {
+ 		DBG("failed to open smn fd: %s\n", strerror(errno));
+ 		goto err_exit;
+ 	}
+ 
+-	obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table", O_RDONLY);
++	obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table", O_RDONLY | O_CLOEXEC);
+ 	if (obj->access.kmod.pm_table_fd == -1) {
+ 		DBG("failed to open pm_table fd: %s\n", strerror(errno));
+ 		close(obj->access.kmod.smn_fd);
+@@ -57,29 +128,43 @@
+ 	return NULL;
+ }
+ 
+-int init_mem_obj_kmod([[maybe_unused]] os_access_obj_t *os_access, [[maybe_unused]] const uintptr_t physAddr) {
++int init_mem_obj_kmod(RA_UNUSED os_access_obj_t *os_access, RA_UNUSED const uintptr_t physAddr,
++		      RA_UNUSED const size_t size) {
+ 	return 0;
+ }
+ 
+ void free_os_access_obj_kmod(os_access_obj_t *obj) {
+-	close(obj->access.kmod.smn_fd);
+-	close(obj->access.kmod.pm_table_fd);
++	if (obj == NULL)
++		return;
++
++	if (obj->access.kmod.smn_fd >= 0)
++		close(obj->access.kmod.smn_fd);
++
++	if (obj->access.kmod.pm_table_fd >= 0)
++		close(obj->access.kmod.pm_table_fd);
++
+ 	free(obj);
+ }
+ 
+ uint32_t smn_reg_read_kmod(const os_access_obj_t *obj, const uint32_t addr) {
+ 	uint32_t result = 0;
+ 
+-	lseek(obj->access.kmod.smn_fd, 0, SEEK_SET);
++	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
++		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
++		return 0;
++	}
+ 
+-	if (write(obj->access.kmod.smn_fd, &addr, sizeof(addr)) == -1) {
++	if (write_full(obj->access.kmod.smn_fd, &addr, sizeof(addr)) != 0) {
+ 		DBG("%s: write error: %s\n", __func__, strerror(errno));
+ 		return 0;
+ 	}
+ 
+-	lseek(obj->access.kmod.smn_fd, 0, SEEK_SET);
++	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
++		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
++		return 0;
++	}
+ 
+-	if (read(obj->access.kmod.smn_fd, &result, sizeof(result)) == -1) {
++	if (read_full(obj->access.kmod.smn_fd, &result, sizeof(result)) != 0) {
+ 		DBG("%s: read error: %s\n", __func__, strerror(errno));
+ 		return 0;
+ 	}
+@@ -90,25 +175,31 @@
+ void smn_reg_write_kmod(const os_access_obj_t *obj, const uint32_t addr, const uint32_t data) {
+ 	const uint32_t write_buffer[2] = { addr, data };
+ 
+-	lseek(obj->access.kmod.smn_fd, 0, SEEK_SET);
++	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
++		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
++		return;
++	}
+ 
+-	if (write(obj->access.kmod.smn_fd, &write_buffer, sizeof(write_buffer)) == -1)
++	if (write_full(obj->access.kmod.smn_fd, write_buffer, sizeof(write_buffer)) != 0)
+ 		DBG("%s: error: %s\n", __func__, strerror(errno));
+ }
+ 
+ int copy_pm_table_kmod(const os_access_obj_t *obj, void *buffer, const size_t size) {
+ 	if (obj->access.kmod.pm_table_size < size) {
+-		DBG("PM table size too small: ryzenadj (%zd) | ryzen_smu (%zd)\n", size, obj->access.kmod.pm_table_size);
++		DBG("PM table size too small: ryzenadj (%zu) | ryzen_smu (%zu)\n", size, obj->access.kmod.pm_table_size);
+ 		return -1;
+ 	}
+ 
+ 	if (obj->access.kmod.pm_table_size != size) {
+-		DBG("PM table size mismatch (reading prefix): ryzenadj (%zd) | ryzen_smu (%zd)\n", size, obj->access.kmod.pm_table_size);
++		DBG("PM table size mismatch (reading prefix): ryzenadj (%zu) | ryzen_smu (%zu)\n", size, obj->access.kmod.pm_table_size);
+ 	}
+ 
+-	lseek(obj->access.kmod.pm_table_fd, 0, SEEK_SET);
++	if (lseek(obj->access.kmod.pm_table_fd, 0, SEEK_SET) == (off_t)-1) {
++		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
++		return -1;
++	}
+ 
+-	if (read(obj->access.kmod.pm_table_fd, buffer, size) == -1) {
++	if (read_full(obj->access.kmod.pm_table_fd, buffer, size) != 0) {
+ 		DBG("%s: error: %s\n", __func__, strerror(errno));
+ 		return -1;
+ 	}
+@@ -116,7 +207,7 @@
+ 	return 0;
+ }
+ 
+-int compare_pm_table_kmod([[maybe_unused]] const void *buffer, [[maybe_unused]] size_t size) {
++int compare_pm_table_kmod(RA_UNUSED const void *buffer, RA_UNUSED size_t size) {
+ 	DBG("internal error: compare_pm_table() should never be called if ryzen_smu is loaded\n");
+ 	return -1;
+ }
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -4,7 +4,7 @@
+ #include "../nb_smu_ops.h"
+ 
+ os_access_obj_t *init_os_access_obj_kmod();
+-int init_mem_obj_kmod(os_access_obj_t *os_access, uintptr_t physAddr);
++int init_mem_obj_kmod(os_access_obj_t *os_access, uintptr_t physAddr, size_t size);
+ int copy_pm_table_kmod(const os_access_obj_t *obj, void *buffer, size_t size);
+ int compare_pm_table_kmod(const void *buffer, size_t size);
+ void free_os_access_obj_kmod(os_access_obj_t *obj);
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -3,6 +3,13 @@
+ /* Ryzen NB SMU Service Request Operations */
+ #include <stdlib.h>
+ 
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <time.h>
++#include <unistd.h>
++#endif
++
+ #include "ryzenadj.h"
+ 
+ #define MP1_C2PMSG_MESSAGE_ADDR_1        0x3B10528
+@@ -42,8 +49,64 @@
+ 	return base + 4 * offt;
+ }
+ 
++static uint64_t monotonic_ms(void)
++{
++#ifdef _WIN32
++	return (uint64_t)GetTickCount64();
++#else
++	struct timespec ts;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
++		return 0;
++
++	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
++#endif
++}
++
++static void short_sleep(void)
++{
++#ifdef _WIN32
++	Sleep(1);
++#else
++	struct timespec ts = { 0, 50 * 1000 }; /* 50 us */
++	nanosleep(&ts, NULL);
++#endif
++}
++
++/*
++ * Wait for the SMU to write its response register.
++ *
++ * The previous implementation was an unbounded `while (response == 0)` spin.
++ * If the SMU never answered - which happens on a wedged SMU, after a failed
++ * firmware handshake, or when another tool is mid-transaction - RyzenAdj hung
++ * forever as root, pegging a core and hammering the SMN/PCI config path, and
++ * could only be killed with SIGKILL. Bound the wait and let the caller report
++ * ADJ_ERR_SMU_TIMEOUT (an error code that existed but was never produced).
++ */
++static uint32_t smu_wait_for_response(smu_t smu)
++{
++	const uint64_t deadline = monotonic_ms() + SMU_RESP_TIMEOUT_MS;
++	unsigned int spins = 0;
++	uint32_t response;
++
++	for (;;) {
++		response = smn_reg_read(smu->os_access, smu->rep);
++		if (response != REP_MSG_Timeout)
++			return response;
++
++		if (monotonic_ms() >= deadline) {
++			DBG("SMU response timed out after %d ms\n", SMU_RESP_TIMEOUT_MS);
++			return REP_MSG_Timeout;
++		}
++
++		/* spin briefly for the common fast path, then back off */
++		if (++spins > 128)
++			short_sleep();
++	}
++}
++
+ uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args) {
+-	uint32_t response = 0x0;
++	uint32_t response;
+ 	DBG("SMU_SERVICE REQ_ID:0x%x\n", id);
+ 	DBG("SMU_SERVICE REQ: arg0: 0x%x, arg1:0x%x, arg2:0x%x, arg3:0x%x, arg4: 0x%x, arg5: 0x%x\n",  \
+ 		args->arg0, args->arg1, args->arg2, args->arg3, args->arg4, args->arg5);
+@@ -59,10 +122,10 @@
+ 	smn_reg_write(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 5), args->arg5);
+ 	/* Send message ID */
+ 	smn_reg_write(smu->os_access, smu->msg, id);
+-	/* Wait until response changed */
+-	while(response == 0x0) {
+-		response = smn_reg_read(smu->os_access, smu->rep);
+-	}
++	/* Wait until response changed (bounded) */
++	response = smu_wait_for_response(smu);
++	if (response == REP_MSG_Timeout)
++		return REP_MSG_Timeout;
+ 	/* Read back arguments */
+ 	args->arg0 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 0));
+ 	args->arg1 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 1));
+@@ -79,7 +142,7 @@
+ 
+ static int smu_service_test(smu_t smu)
+ {
+-	uint32_t response = 0x0;
++	uint32_t response;
+ 
+ 	/* Clear the response */
+ 	smn_reg_write(smu->os_access, smu->rep, 0x0);
+@@ -92,9 +155,11 @@
+ 
+ 	/* Send message ID */
+ 	smn_reg_write(smu->os_access, smu->msg, SMU_TEST_MSG);
+-	/* Wait until response changed */
+-	while(response == 0x0) {
+-		response = smn_reg_read(smu->os_access, smu->rep);
++	/* Wait until response changed (bounded) */
++	response = smu_wait_for_response(smu);
++	if (response == REP_MSG_Timeout) {
++		DBG("SMU test message timed out\n");
++		return 0;
+ 	}
+ 
+ 	return response == REP_MSG_OK;
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -12,6 +12,18 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ 
++/*
++ * Portable "this parameter is intentionally unused" marker.
++ * The C23 [[maybe_unused]] spelling that used to be sprinkled over the OS
++ * backends is a GCC/Clang extension in every pre-C23 mode and a hard error on
++ * older compilers and MSVC.
++ */
++#if defined(__GNUC__) || defined(__clang__)
++#define RA_UNUSED __attribute__((unused))
++#else
++#define RA_UNUSED
++#endif
++
+ #ifdef NDEBUG
+ #define DBG(...)
+ #else
+@@ -27,6 +39,12 @@
+ #define NB_PCI_REG_ADDR_ADDR			0xB8
+ #define NB_PCI_REG_DATA_ADDR			0xBC
+ 
++/*
++ * 0x0 is the "response register not written yet" state. We also use it as the
++ * timeout marker: smu_service_req() only ever returns 0x0 when the SMU failed
++ * to answer within SMU_RESP_TIMEOUT_MS.
++ */
++#define REP_MSG_Timeout               0x0
+ #define REP_MSG_OK                    0x1
+ #define REP_MSG_Failed                0xFF
+ #define REP_MSG_UnknownCmd            0xFE
+@@ -69,11 +87,22 @@
+ } *smu_t;
+ 
+ os_access_obj_t *init_os_access_obj();
+-int init_mem_obj(os_access_obj_t *os_access, uintptr_t physAddr);
++int init_mem_obj(os_access_obj_t *os_access, uintptr_t physAddr, size_t size);
+ int copy_pm_table(const os_access_obj_t *obj, void *buffer, size_t size);
+ int compare_pm_table(const void *buffer, size_t size);
+ void free_os_access_obj(os_access_obj_t *obj);
+ 
++/* Upper bound for how long we busy-wait on the SMU response register. */
++#define SMU_RESP_TIMEOUT_MS 1000
++
++/*
++ * Hard sanity bound on the PM table size. The largest table we know about is
++ * 0xE50 bytes and unknown table versions fall back to a 0x1000 probe, so 8 KiB
++ * leaves plenty of headroom while stopping a bogus SMU/sysfs value from
++ * driving a huge allocation or an out-of-range mapping.
++ */
++#define RYZENADJ_MAX_TABLE_SIZE 0x2000u
++
+ uint32_t smn_reg_read(const os_access_obj_t *obj, uint32_t addr);
+ void smn_reg_write(const os_access_obj_t *obj, uint32_t addr, uint32_t data);
+ bool is_using_smu_driver();
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -20,6 +20,8 @@
+ 	uint32_t table_ver;
+ 	size_t table_size;
+ 	float *table_values;
++	/* guards against init_table() <-> refresh_table() recursing forever */
++	int table_init_busy;
+ };
+ 
+ enum ryzen_family cpuid_get_family();
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -17,8 +17,9 @@
+ lpGetPhysLong gfpGetPhysLong;
+ lpMapPhysToLin gfpMapPhysToLin;
+ lpUnmapPhysicalMemory gfpUnmapPhysicalMemory;
+-uint32_t *pdwLinAddr;
+-HANDLE physicalMemoryHandle;
++static uint32_t *pdwLinAddr = NULL;
++static HANDLE physicalMemoryHandle = NULL;
++static size_t phy_map_len = 0;
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -70,8 +71,25 @@
+         return;
+ 
+     DeinitializeOls();
+-    gfpUnmapPhysicalMemory(physicalMemoryHandle, *pdwLinAddr);
+-    FreeLibrary(obj->inpoutDll);
++
++    /*
++     * Two bugs fixed here:
++     *  - this ran unconditionally, so every invocation that never called
++     *    init_mem_obj() (i.e. any plain adjustment without --info) called a
++     *    NULL function pointer and dereferenced a NULL pdwLinAddr.
++     *  - it passed *pdwLinAddr (the first dword of the mapping) instead of
++     *    the linear address itself.
++     */
++    if (pdwLinAddr != NULL && gfpUnmapPhysicalMemory != NULL) {
++        gfpUnmapPhysicalMemory(physicalMemoryHandle, (uintptr_t)pdwLinAddr);
++        pdwLinAddr = NULL;
++        physicalMemoryHandle = NULL;
++        phy_map_len = 0;
++    }
++
++    if (obj->inpoutDll != NULL)
++        FreeLibrary(obj->inpoutDll);
++
+     free(obj);
+ }
+ 
+@@ -85,7 +103,7 @@
+     WritePciConfigDword(obj->pci_address, NB_PCI_REG_DATA_ADDR, data);
+ }
+ 
+-int init_mem_obj(os_access_obj_t *os_access, uintptr_t physAddr) {
++int init_mem_obj(os_access_obj_t *os_access, uintptr_t physAddr, size_t size) {
+     HINSTANCE hInpOutDll = LoadLibrary ("inpoutx64.DLL");
+ 
+     if (hInpOutDll == NULL) {
+@@ -103,9 +121,17 @@
+         return -1;
+     }
+ 
+-    pdwLinAddr = (uint32_t*)gfpMapPhysToLin(physAddr, 0x1000, &physicalMemoryHandle);
++    if (gfpIsInpOutDriverOpen == NULL || gfpMapPhysToLin == NULL || gfpUnmapPhysicalMemory == NULL) {
++        DBG("inpoutx64.DLL is missing required exports\n");
++        return -1;
++    }
++
++    phy_map_len = (size != 0 && size <= RYZENADJ_MAX_TABLE_SIZE) ? size : RYZENADJ_MAX_TABLE_SIZE;
++
++    pdwLinAddr = (uint32_t*)gfpMapPhysToLin(physAddr, phy_map_len, &physicalMemoryHandle);
+     if (pdwLinAddr == NULL) {
+         DBG("failed to map memory\n");
++        phy_map_len = 0;
+         return -1;
+     }
+ 
+@@ -115,11 +141,21 @@
+ }
+ 
+ int copy_pm_table(const os_access_obj_t *obj, void *buffer, const size_t size) {
++    (void)obj;
++
++    if (pdwLinAddr == NULL || size > phy_map_len) {
++        DBG("pm_table read of %zu bytes exceeds mapped window of %zu bytes\n", size, phy_map_len);
++        return -1;
++    }
++
+     memcpy(buffer, pdwLinAddr, size);
+     return 0;
+ }
+ 
+ int compare_pm_table(const void *buffer, const size_t size) {
++    if (pdwLinAddr == NULL || size > phy_map_len)
++        return -1;
++
+     return memcmp(buffer, pdwLinAddr, size);
+ }
+ 
+diff -ruN --label a/RyzenAdj-master --label b/RyzenAdj-master a/RyzenAdj-master b/RyzenAdj-master
+--- a/RyzenAdj-master
++++ b/RyzenAdj-master
+@@ -4,6 +4,13 @@
+ 
+ #include <string.h>
+ #include <stdlib.h>
++#include <stdio.h>
++#include <inttypes.h>
++#include <stdint.h>
++
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ 
+ #include "lib/ryzenadj.h"
+ #include "argparse.h"
+@@ -11,10 +18,16 @@
+ #define STRINGIFY2(X) #X
+ #define STRINGIFY(X) STRINGIFY2(X)
+ 
++/*
++ * Max unsigned means "the user did not pass this option". Spelled out so the
++ * comparison below is unsigned-vs-unsigned instead of tripping -Wsign-compare.
++ */
++#define ARG_UNSET UINT32_MAX
++
+ #define _do_adjust(ARG) \
+ do {                                                                              \
+ 	/* ignore max unsigned integer values */                                      \
+-	if (ARG != -1) {                                                              \
++	if (ARG != ARG_UNSET) {                                                              \
+ 		int adjerr = set_##ARG(ry, ARG);                                          \
+ 		if (!adjerr){                                                             \
+ 			any_adjust_applied = 1;                                               \
+@@ -28,6 +41,9 @@
+ 		} else if (adjerr == ADJ_ERR_SMU_REJECTED) {                              \
+ 			printf("set_" STRINGIFY(ARG) " is rejected by SMU\n");                \
+ 			err = -1;                                                             \
++		} else if (adjerr == ADJ_ERR_SMU_TIMEOUT) {                               \
++			printf("set_" STRINGIFY(ARG) " timed out waiting for the SMU\n");     \
++			err = -1;                                                             \
+ 		} else {                                                                  \
+ 			printf("Failed to set" STRINGIFY(ARG) " \n");                         \
+ 			err = -1;                                                             \
+@@ -51,6 +67,9 @@
+ 		} else if (adjerr == ADJ_ERR_SMU_REJECTED) {                              \
+ 			printf("set_" STRINGIFY(ARG) " is rejected by SMU\n");                \
+ 			err = -1;                                                             \
++		} else if (adjerr == ADJ_ERR_SMU_TIMEOUT) {                               \
++			printf("set_" STRINGIFY(ARG) " timed out waiting for the SMU\n");     \
++			err = -1;                                                             \
+ 		} else {                                                                  \
+ 			printf("Failed to set" STRINGIFY(ARG) " \n");                         \
+ 			err = -1;                                                             \
+@@ -71,6 +90,7 @@
+ 		case FAM_RENOIR: return "Renoir";
+ 		case FAM_CEZANNE: return "Cezanne";
+ 		case FAM_DALI: return "Dali";
++		case FAM_MENDOCINO: return "Mendocino";
+ 		case FAM_LUCIENNE: return "Lucienne";
+ 		case FAM_VANGOGH: return "Vangogh";
+ 		case FAM_REMBRANDT: return "Rembrandt";
+@@ -108,52 +128,69 @@
+ 	//print table in github markdown
+ 	printf("|        Name         |   Value   |     Parameter      |\n");
+ 	printf("|---------------------|-----------|--------------------|\n");
+-	char tableFormat[] = "| %-19s | %9.3lf | %-18s |\n";
+-	printf(tableFormat, "STAPM LIMIT", get_stapm_limit(ry), "stapm-limit");
+-	printf(tableFormat, "STAPM VALUE", get_stapm_value(ry), "");
+-	printf(tableFormat, "PPT LIMIT FAST", get_fast_limit(ry), "fast-limit");
+-	printf(tableFormat, "PPT VALUE FAST", get_fast_value(ry), "");
+-	printf(tableFormat, "PPT LIMIT SLOW", get_slow_limit(ry), "slow-limit");
+-	printf(tableFormat, "PPT VALUE SLOW", get_slow_value(ry), "");
+-	printf(tableFormat, "StapmTimeConst", get_stapm_time(ry), "stapm-time");
+-	printf(tableFormat, "SlowPPTTimeConst", get_slow_time(ry), "slow-time");
+-	printf(tableFormat, "PPT LIMIT APU", get_apu_slow_limit(ry), "apu-slow-limit");
+-	printf(tableFormat, "PPT VALUE APU", get_apu_slow_value(ry), "");
+-	printf(tableFormat, "TDC LIMIT VDD", get_vrm_current(ry), "vrm-current");
+-	printf(tableFormat, "TDC VALUE VDD", get_vrm_current_value(ry), "");
+-	printf(tableFormat, "TDC LIMIT SOC", get_vrmsoc_current(ry), "vrmsoc-current");
+-	printf(tableFormat, "TDC VALUE SOC", get_vrmsoc_current_value(ry), "");
+-	printf(tableFormat, "EDC LIMIT VDD", get_vrmmax_current(ry), "vrmmax-current");
+-	printf(tableFormat, "EDC VALUE VDD", get_vrmmax_current_value(ry), "");
+-	printf(tableFormat, "EDC LIMIT SOC", get_vrmsocmax_current(ry), "vrmsocmax-current");
+-	printf(tableFormat, "EDC VALUE SOC", get_vrmsocmax_current_value(ry), "");
+-	printf(tableFormat, "THM LIMIT CORE", get_tctl_temp(ry), "tctl-temp");
+-	printf(tableFormat, "THM VALUE CORE", get_tctl_temp_value(ry), "");
+-	printf(tableFormat, "STT LIMIT APU", get_apu_skin_temp_limit(ry), "apu-skin-temp");
+-	printf(tableFormat, "STT VALUE APU", get_apu_skin_temp_value(ry), "");
+-	printf(tableFormat, "STT LIMIT dGPU", get_dgpu_skin_temp_limit(ry), "dgpu-skin-temp");
+-	printf(tableFormat, "STT VALUE dGPU", get_dgpu_skin_temp_value(ry), "");
+-	printf(tableFormat, "CCLK Boost SETPOINT", get_cclk_setpoint(ry), "power-saving /");
+-	printf(tableFormat, "CCLK BUSY VALUE", get_cclk_busy_value(ry), "max-performance");
++#define tableFormat(NAME, VALUE, PARAM) \
++	printf("| %-19s | %9.3f | %-18s |\n", (NAME), (double)(VALUE), (PARAM))
++	tableFormat("STAPM LIMIT", get_stapm_limit(ry), "stapm-limit");
++	tableFormat("STAPM VALUE", get_stapm_value(ry), "");
++	tableFormat("PPT LIMIT FAST", get_fast_limit(ry), "fast-limit");
++	tableFormat("PPT VALUE FAST", get_fast_value(ry), "");
++	tableFormat("PPT LIMIT SLOW", get_slow_limit(ry), "slow-limit");
++	tableFormat("PPT VALUE SLOW", get_slow_value(ry), "");
++	tableFormat("StapmTimeConst", get_stapm_time(ry), "stapm-time");
++	tableFormat("SlowPPTTimeConst", get_slow_time(ry), "slow-time");
++	tableFormat("PPT LIMIT APU", get_apu_slow_limit(ry), "apu-slow-limit");
++	tableFormat("PPT VALUE APU", get_apu_slow_value(ry), "");
++	tableFormat("TDC LIMIT VDD", get_vrm_current(ry), "vrm-current");
++	tableFormat("TDC VALUE VDD", get_vrm_current_value(ry), "");
++	tableFormat("TDC LIMIT SOC", get_vrmsoc_current(ry), "vrmsoc-current");
++	tableFormat("TDC VALUE SOC", get_vrmsoc_current_value(ry), "");
++	tableFormat("EDC LIMIT VDD", get_vrmmax_current(ry), "vrmmax-current");
++	tableFormat("EDC VALUE VDD", get_vrmmax_current_value(ry), "");
++	tableFormat("EDC LIMIT SOC", get_vrmsocmax_current(ry), "vrmsocmax-current");
++	tableFormat("EDC VALUE SOC", get_vrmsocmax_current_value(ry), "");
++	tableFormat("THM LIMIT CORE", get_tctl_temp(ry), "tctl-temp");
++	tableFormat("THM VALUE CORE", get_tctl_temp_value(ry), "");
++	tableFormat("STT LIMIT APU", get_apu_skin_temp_limit(ry), "apu-skin-temp");
++	tableFormat("STT VALUE APU", get_apu_skin_temp_value(ry), "");
++	tableFormat("STT LIMIT dGPU", get_dgpu_skin_temp_limit(ry), "dgpu-skin-temp");
++	tableFormat("STT VALUE dGPU", get_dgpu_skin_temp_value(ry), "");
++	tableFormat("CCLK Boost SETPOINT", get_cclk_setpoint(ry), "power-saving /");
++	tableFormat("CCLK BUSY VALUE", get_cclk_busy_value(ry), "max-performance");
++#undef tableFormat
+ }
+ 
+ static void show_table_dump(ryzen_access ry, int any_adjust_applied)
+ {
+ 	size_t index, table_size;
+ 	uint32_t *table_data_copy;
+-	float *current_table_values, *old_table_values;
++	float *current_table_values, *old_table_values = NULL;
+ 
+ 	printf("PM Table Dump of Version: %x\n", get_table_ver(ry));
+ 	table_size = get_table_size(ry);
+ 
+ 	current_table_values = get_table_values(ry);
++	if (current_table_values == NULL || table_size < 4) {
++		printf("Power metric table is not available, nothing to dump\n");
++		return;
++	}
++
++	/* the old code used the malloc results without checking them */
+ 	table_data_copy = malloc(table_size);
++	if (table_data_copy == NULL) {
++		printf("Out of memory while dumping the power metric table\n");
++		return;
++	}
+ 	memcpy(table_data_copy, current_table_values, table_size);
+ 
+ 	if(any_adjust_applied)
+ 	{
+ 		//copy old values before refresh
+ 		old_table_values = malloc(table_size);
++		if (old_table_values == NULL) {
++			printf("Out of memory while dumping the power metric table\n");
++			free(table_data_copy);
++			return;
++		}
+ 		memcpy(old_table_values, table_data_copy, table_size);
+ 
+ 		int errorcode = refresh_table(ry);
+@@ -164,10 +201,15 @@
+ 		//print table in github markdown
+ 		printf("| Offset |    Data    |   Value   | After Adjust |\n");
+ 		printf("|--------|------------|-----------|--------------|\n");
+-		char tableFormat[] = "| 0x%04X | 0x%08X | %9.3lf | %12.3lf |\n";
+ 		for(index = 0; index < table_size / 4; index++)
+ 		{
+-			printf(tableFormat, index * 4, table_data_copy[index], old_table_values[index], current_table_values[index]);
++			/*
++			 * index is size_t; the previous "%04X" consumed only an unsigned
++			 * int from the varargs list, which is undefined behaviour on LP64.
++			 */
++			printf("| 0x%04zX | 0x%08" PRIX32 " | %9.3f | %12.3f |\n",
++			       index * 4, table_data_copy[index],
++			       (double)old_table_values[index], (double)current_table_values[index]);
+ 		}
+ 
+ 		free(old_table_values);
+@@ -177,10 +219,10 @@
+ 		//print table in github markdown
+ 		printf("| Offset |    Data    |   Value   |\n");
+ 		printf("|--------|------------|-----------|\n");
+-		char tableFormat[] = "| 0x%04X | 0x%08X | %9.3lf |\n";
+ 		for(index = 0; index < table_size / 4; index++)
+ 		{
+-			printf(tableFormat, index * 4, table_data_copy[index], current_table_values[index]);
++			printf("| 0x%04zX | 0x%08" PRIX32 " | %9.3f |\n",
++			       index * 4, table_data_copy[index], (double)current_table_values[index]);
+ 		}
+ 	}
+ 
+@@ -197,13 +239,13 @@
+ 	int info = 0, dump_table = 0, any_adjust_applied = 0;
+ 	int power_saving = 0, max_performance = 0, enable_oc = 0x0, disable_oc = 0x0;
+ 	//init unsigned types with max value because we treat max value as unset
+-	uint32_t stapm_limit = -1, fast_limit = -1, slow_limit = -1, slow_time = -1, stapm_time = -1, tctl_temp = -1;
+-	uint32_t vrm_current = -1, vrmsoc_current = -1, vrmmax_current = -1, vrmsocmax_current = -1, psi0_current = -1, psi0soc_current = -1;
+-	uint32_t vrmgfx_current = -1, vrmcvip_current = -1, vrmgfxmax_current = -1, psi3cpu_current = -1, psi3gfx_current = -1;
+-	uint32_t max_socclk_freq = -1, min_socclk_freq = -1, max_fclk_freq = -1, min_fclk_freq = -1, max_vcn = -1, min_vcn = -1, max_lclk = -1, min_lclk = -1;
+-	uint32_t max_gfxclk_freq = -1, min_gfxclk_freq = -1, prochot_deassertion_ramp = -1, apu_skin_temp_limit = -1, dgpu_skin_temp_limit = -1, apu_slow_limit = -1;
+-	uint32_t skin_temp_power_limit = -1;
+-	uint32_t gfx_clk = -1, oc_clk = -1, oc_volt = -1, coall = -1, coper = -1, cogfx = -1;
++	uint32_t stapm_limit = ARG_UNSET, fast_limit = ARG_UNSET, slow_limit = ARG_UNSET, slow_time = ARG_UNSET, stapm_time = ARG_UNSET, tctl_temp = ARG_UNSET;
++	uint32_t vrm_current = ARG_UNSET, vrmsoc_current = ARG_UNSET, vrmmax_current = ARG_UNSET, vrmsocmax_current = ARG_UNSET, psi0_current = ARG_UNSET, psi0soc_current = ARG_UNSET;
++	uint32_t vrmgfx_current = ARG_UNSET, vrmcvip_current = ARG_UNSET, vrmgfxmax_current = ARG_UNSET, psi3cpu_current = ARG_UNSET, psi3gfx_current = ARG_UNSET;
++	uint32_t max_socclk_freq = ARG_UNSET, min_socclk_freq = ARG_UNSET, max_fclk_freq = ARG_UNSET, min_fclk_freq = ARG_UNSET, max_vcn = ARG_UNSET, min_vcn = ARG_UNSET, max_lclk = ARG_UNSET, min_lclk = ARG_UNSET;
++	uint32_t max_gfxclk_freq = ARG_UNSET, min_gfxclk_freq = ARG_UNSET, prochot_deassertion_ramp = ARG_UNSET, apu_skin_temp_limit = ARG_UNSET, dgpu_skin_temp_limit = ARG_UNSET, apu_slow_limit = ARG_UNSET;
++	uint32_t skin_temp_power_limit = ARG_UNSET;
++	uint32_t gfx_clk = ARG_UNSET, oc_clk = ARG_UNSET, oc_volt = ARG_UNSET, coall = ARG_UNSET, coper = ARG_UNSET, cogfx = ARG_UNSET;
+ 
+ 	//create structure for parsing
+ 	struct argparse_option options[] = {
+@@ -265,6 +307,16 @@
+ 	argc = argparse_parse(&argparse, argc, argv);
+ 
+ 
++#ifndef _WIN32
++	/*
++	 * Not a hard failure: a CAP_SYS_RAWIO-only setup or a permissive
++	 * ryzen_smu sysfs can work without full root. But say so up front instead
++	 * of letting the user guess at "Unable to get os_access Obj".
++	 */
++	if (geteuid() != 0)
++		fprintf(stderr, "warning: not running as root, SMU access will most likely fail\n");
++#endif
++
+ 	//init RyzenAdj and validate that it was able to
+ 	ry = init_ryzenadj();
+ 	if(!ry){
+@@ -279,9 +331,12 @@
+ 
+ 	if (info || dump_table) {
+ 		//init before adjustment to get the default values
+-		err = init_table(ry);
+-		if (err) {
+-			printf("Unable to init power metric table: %d, this does not affect adjustments because it is only needed for monitoring.\n", err);
++		int table_err = init_table(ry);
++		if (table_err) {
++			printf("Unable to init power metric table: %d, this does not affect adjustments because it is only needed for monitoring.\n", table_err);
++			//monitoring is unavailable, but adjustments below are still valid
++			info = 0;
++			dump_table = 0;
+ 		}
+ 	}
+ 

@@ -10,6 +10,9 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
+#include <ctype.h>
+#include <stdint.h>
 #include "argparse.h"
 
 #define OPT_UNSET 1
@@ -33,6 +36,32 @@ prefix_cmp(const char *str, const char *prefix)
 		}
 }
 
+/*
+ * Portable strerror wrapper.
+ *
+ * The old code called strerror_r() and then printed `buf` while ignoring the
+ * return value. That is only correct for the XSI variant; when the translation
+ * unit is built with _GNU_SOURCE (which several distro toolchains and any
+ * `-std=gnu*` + feature-test combination can pull in) glibc provides the GNU
+ * variant, which may leave `buf` untouched and return a pointer to a static
+ * string - so the user got an empty error message.
+ */
+static const char *
+safe_strerror(int err, char *buf, size_t buflen)
+{
+	buf[0] = '\0';
+#ifdef _WIN32
+	strerror_s(buf, buflen, err);
+	return buf;
+#elif defined(__GLIBC__) && defined(_GNU_SOURCE)
+	return strerror_r(err, buf, buflen);
+#else
+	if (strerror_r(err, buf, buflen) != 0)
+		snprintf(buf, buflen, "errno %d", err);
+	return buf;
+#endif
+}
+
 static void
 argparse_error(struct argparse *self, const struct argparse_option *opt,
 			   const char *reason, int flags)
@@ -52,8 +81,8 @@ argparse_getvalue(struct argparse *self, const struct argparse_option *opt,
 {
 	const char *s = NULL;
 	char buf[256];
+
 	buf[0] = 0;
-	char *pbuf = buf;
 
 	if (!opt->value)
 		goto skipped;
@@ -86,72 +115,105 @@ argparse_getvalue(struct argparse *self, const struct argparse_option *opt,
 			argparse_error(self, opt, "requires a value", flags);
 		}
 		break;
-	case ARGPARSE_OPT_INTEGER:
-		errno = 0;
+	case ARGPARSE_OPT_INTEGER: {
+		const char *raw = NULL;
+		long lval;
+
 		if (self->optvalue) {
-			*(int *)opt->value = strtol(self->optvalue, (char **)&s, 0);
-			self->optvalue     = NULL;
+			raw = self->optvalue;
+			self->optvalue = NULL;
 		} else if (self->argc > 1) {
 			self->argc--;
-			*(int *)opt->value = strtol(*++self->argv, (char **)&s, 0);
+			raw = *++self->argv;
 		} else {
 			argparse_error(self, opt, "requires a value", flags);
 		}
-		if (errno){
-			#ifdef _WIN32
-			strerror_s(buf, sizeof(buf), errno);
-			#else
-			strerror_r(errno, buf, sizeof(buf));
-			#endif
-			argparse_error(self, opt, pbuf, flags);
-		}
-		if (s[0] != '\0')
+
+		if (raw == NULL || raw[0] == '\0')
+			argparse_error(self, opt, "requires a value", flags);
+
+		errno = 0;
+		lval = strtol(raw, (char **)&s, 0);
+		if (errno)
+			argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
+		if (s == raw || s[0] != '\0')
 			argparse_error(self, opt, "expects an integer value", flags);
+		if (lval < INT_MIN || lval > INT_MAX)
+			argparse_error(self, opt, "value is out of range for a 32-bit signed integer", flags);
+
+		*(int *)opt->value = (int)lval;
 		break;
-	case ARGPARSE_OPT_U32:
-		errno = 0;
+	}
+	case ARGPARSE_OPT_U32: {
+		const char *raw = NULL;
+		const char *scan;
+		unsigned long uval;
+
 		if (self->optvalue) {
-			*(uint32_t *)opt->value = strtoul(self->optvalue, (char **)&s, 0);
-			self->optvalue     = NULL;
+			raw = self->optvalue;
+			self->optvalue = NULL;
 		} else if (self->argc > 1) {
 			self->argc--;
-			*(uint32_t *)opt->value = strtoul(*++self->argv, (char **)&s, 0);
+			raw = *++self->argv;
 		} else {
 			argparse_error(self, opt, "requires a value", flags);
 		}
-		if (errno){
-			#ifdef _WIN32
-			strerror_s(buf, sizeof(buf), errno);
-			#else
-			strerror_r(errno, buf, sizeof(buf));
-			#endif
-			argparse_error(self, opt, pbuf, flags);
-		}
-		if (s[0] != '\0')
+
+		if (raw == NULL || raw[0] == '\0')
+			argparse_error(self, opt, "requires a value", flags);
+
+		/*
+		 * strtoul() cheerfully wraps negative input: "-1" became 0xFFFFFFFF,
+		 * which is exactly the sentinel RyzenAdj uses for "option not given",
+		 * and "-5" became 4294967291 - a value that was then handed straight
+		 * to the SMU as a power/current limit. Reject signs outright.
+		 */
+		scan = raw;
+		while (isspace((unsigned char)*scan))
+			scan++;
+		if (*scan == '-' || *scan == '+')
+			argparse_error(self, opt, "expects a non-negative value", flags);
+
+		errno = 0;
+		uval = strtoul(raw, (char **)&s, 0);
+		if (errno)
+			argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
+		if (s == raw || s[0] != '\0')
 			argparse_error(self, opt, "expects an unsigned 32-bit integer value", flags);
+		/* on LP64 strtoul returns 64 bit; the assignment used to truncate silently */
+		if (uval > UINT32_MAX)
+			argparse_error(self, opt, "value is out of range for a 32-bit unsigned integer", flags);
+
+		*(uint32_t *)opt->value = (uint32_t)uval;
 		break;
-	case ARGPARSE_OPT_FLOAT:
-		errno = 0;
+	}
+	case ARGPARSE_OPT_FLOAT: {
+		const char *raw = NULL;
+		float fval;
+
 		if (self->optvalue) {
-			*(float *)opt->value = strtof(self->optvalue, (char **)&s);
-			self->optvalue       = NULL;
+			raw = self->optvalue;
+			self->optvalue = NULL;
 		} else if (self->argc > 1) {
 			self->argc--;
-			*(float *)opt->value = strtof(*++self->argv, (char **)&s);
+			raw = *++self->argv;
 		} else {
 			argparse_error(self, opt, "requires a value", flags);
 		}
-		if (errno){
-			#ifdef _WIN32
-			strerror_s(buf, sizeof(buf), errno);
-			#else
-			strerror_r(errno, buf, sizeof(buf));
-			#endif
-			argparse_error(self, opt, pbuf, flags);
-		}
-		if (s[0] != '\0')
+
+		if (raw == NULL || raw[0] == '\0')
+			argparse_error(self, opt, "requires a value", flags);
+
+		errno = 0;
+		fval = strtof(raw, (char **)&s);
+		if (errno)
+			argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
+		if (s == raw || s[0] != '\0')
 			argparse_error(self, opt, "expects a numerical value", flags);
+
+		*(float *)opt->value = fval;
 		break;
+	}
 	default:
 		assert(0);
 	}

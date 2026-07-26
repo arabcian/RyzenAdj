@@ -3,6 +3,13 @@
 /* Ryzen NB SMU Service Request Operations */
 #include <stdlib.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#include <unistd.h>
+#endif
+
 #include "ryzenadj.h"
 
 #define MP1_C2PMSG_MESSAGE_ADDR_1        0x3B10528
@@ -42,8 +49,64 @@ static uint32_t c2pmsg_argX_addr(const uint32_t base, const uint32_t offt) {
 	return base + 4 * offt;
 }
 
+static uint64_t monotonic_ms(void)
+{
+#ifdef _WIN32
+	return (uint64_t)GetTickCount64();
+#else
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+		return 0;
+
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+#endif
+}
+
+static void short_sleep(void)
+{
+#ifdef _WIN32
+	Sleep(1);
+#else
+	struct timespec ts = { 0, 50 * 1000 }; /* 50 us */
+	nanosleep(&ts, NULL);
+#endif
+}
+
+/*
+ * Wait for the SMU to write its response register.
+ *
+ * The previous implementation was an unbounded `while (response == 0)` spin.
+ * If the SMU never answered - which happens on a wedged SMU, after a failed
+ * firmware handshake, or when another tool is mid-transaction - RyzenAdj hung
+ * forever as root, pegging a core and hammering the SMN/PCI config path, and
+ * could only be killed with SIGKILL. Bound the wait and let the caller report
+ * ADJ_ERR_SMU_TIMEOUT (an error code that existed but was never produced).
+ */
+static uint32_t smu_wait_for_response(smu_t smu)
+{
+	const uint64_t deadline = monotonic_ms() + SMU_RESP_TIMEOUT_MS;
+	unsigned int spins = 0;
+	uint32_t response;
+
+	for (;;) {
+		response = smn_reg_read(smu->os_access, smu->rep);
+		if (response != REP_MSG_Timeout)
+			return response;
+
+		if (monotonic_ms() >= deadline) {
+			DBG("SMU response timed out after %d ms\n", SMU_RESP_TIMEOUT_MS);
+			return REP_MSG_Timeout;
+		}
+
+		/* spin briefly for the common fast path, then back off */
+		if (++spins > 128)
+			short_sleep();
+	}
+}
+
 uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args) {
-	uint32_t response = 0x0;
+	uint32_t response;
 	DBG("SMU_SERVICE REQ_ID:0x%x\n", id);
 	DBG("SMU_SERVICE REQ: arg0: 0x%x, arg1:0x%x, arg2:0x%x, arg3:0x%x, arg4: 0x%x, arg5: 0x%x\n",  \
 		args->arg0, args->arg1, args->arg2, args->arg3, args->arg4, args->arg5);
@@ -59,10 +122,10 @@ uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args)
 	smn_reg_write(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 5), args->arg5);
 	/* Send message ID */
 	smn_reg_write(smu->os_access, smu->msg, id);
-	/* Wait until response changed */
-	while(response == 0x0) {
-		response = smn_reg_read(smu->os_access, smu->rep);
-	}
+	/* Wait until response changed (bounded) */
+	response = smu_wait_for_response(smu);
+	if (response == REP_MSG_Timeout)
+		return REP_MSG_Timeout;
 	/* Read back arguments */
 	args->arg0 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 0));
 	args->arg1 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 1));
@@ -79,7 +142,7 @@ uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args)
 
 static int smu_service_test(smu_t smu)
 {
-	uint32_t response = 0x0;
+	uint32_t response;
 
 	/* Clear the response */
 	smn_reg_write(smu->os_access, smu->rep, 0x0);
@@ -92,9 +155,11 @@ static int smu_service_test(smu_t smu)
 
 	/* Send message ID */
 	smn_reg_write(smu->os_access, smu->msg, SMU_TEST_MSG);
-	/* Wait until response changed */
-	while(response == 0x0) {
-		response = smn_reg_read(smu->os_access, smu->rep);
+	/* Wait until response changed (bounded) */
+	response = smu_wait_for_response(smu);
+	if (response == REP_MSG_Timeout) {
+		DBG("SMU test message timed out\n");
+		return 0;
 	}
 
 	return response == REP_MSG_OK;

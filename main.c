@@ -5,6 +5,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <inttypes.h>
+#include <stdint.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "lib/ryzenadj.h"
 #include "argparse.h"
@@ -13,68 +19,15 @@
 #define STRINGIFY(X) STRINGIFY2(X)
 
 /*
- * --set-coper can legitimately be passed once per core (up to 16 on
- * current parts: 2 CCDs x 8 cores). argparse's OPT_U32 only ever
- * writes into a single uint32_t, so passing --set-coper= multiple
- * times on one command line just overwrites the same variable —
- * only the last value parsed ever reaches the SMU.
- *
- * To fix that without touching argparse itself, we scan the raw
- * argv for every --set-coper=<value> (or --set-coper <value>)
- * occurrence BEFORE argparse_parse() runs, and collect them all
- * here. argparse still parses --set-coper as before (for backward
- * compatibility with existing single-value scripts/tooling), but
- * the values applied at the end come from this list whenever it
- * has more than one entry.
+ * Max unsigned means "the user did not pass this option". Spelled out so the
+ * comparison below is unsigned-vs-unsigned instead of tripping -Wsign-compare.
  */
-#define MAX_COPER_VALUES 16
-
-static uint32_t coper_values[MAX_COPER_VALUES];
-static int coper_value_count = 0;
-
-/* Collects every --set-coper occurrence from argv into coper_values.
- * Handles both --set-coper=VALUE and --set-coper VALUE forms. Silently
- * stops collecting past MAX_COPER_VALUES (still lets argparse report
- * the individual values normally; only the "apply all" step is capped). */
-static void collect_coper_values(int argc, const char **argv) {
-	const char *opt = "--set-coper";
-	size_t opt_len = strlen(opt);
-
-	for (int i = 1; i < argc; i++) {
-		const char *arg = argv[i];
-		if (strncmp(arg, opt, opt_len) != 0) {
-			continue;
-		}
-
-		const char *valstr = NULL;
-		if (arg[opt_len] == '=') {
-			valstr = arg + opt_len + 1;
-		} else if (arg[opt_len] == '\0' && i + 1 < argc) {
-			valstr = argv[i + 1];
-		} else {
-			continue; /* something like --set-coperxyz, not our flag */
-		}
-
-		char *end = NULL;
-		unsigned long v = strtoul(valstr, &end, 0);
-		if (end == valstr) {
-			continue; /* not a valid number, let argparse raise the error */
-		}
-
-		if (coper_value_count < MAX_COPER_VALUES) {
-			coper_values[coper_value_count++] = (uint32_t)v;
-		} else {
-			fprintf(stderr,
-				"Warning: more than %d --set-coper values given; ignoring extras beyond the first %d\n",
-				MAX_COPER_VALUES, MAX_COPER_VALUES);
-		}
-	}
-}
+#define ARG_UNSET UINT32_MAX
 
 #define _do_adjust(ARG) \
 do {                                                                              \
 	/* ignore max unsigned integer values */                                      \
-	if (ARG != -1) {                                                              \
+	if (ARG != ARG_UNSET) {                                                              \
 		int adjerr = set_##ARG(ry, ARG);                                          \
 		if (!adjerr){                                                             \
 			any_adjust_applied = 1;                                               \
@@ -87,6 +40,9 @@ do {                                                                            
 			err = -1;                                                             \
 		} else if (adjerr == ADJ_ERR_SMU_REJECTED) {                              \
 			printf("set_" STRINGIFY(ARG) " is rejected by SMU\n");                \
+			err = -1;                                                             \
+		} else if (adjerr == ADJ_ERR_SMU_TIMEOUT) {                               \
+			printf("set_" STRINGIFY(ARG) " timed out waiting for the SMU\n");     \
 			err = -1;                                                             \
 		} else {                                                                  \
 			printf("Failed to set" STRINGIFY(ARG) " \n");                         \
@@ -111,6 +67,9 @@ do {                                                                            
 		} else if (adjerr == ADJ_ERR_SMU_REJECTED) {                              \
 			printf("set_" STRINGIFY(ARG) " is rejected by SMU\n");                \
 			err = -1;                                                             \
+		} else if (adjerr == ADJ_ERR_SMU_TIMEOUT) {                               \
+			printf("set_" STRINGIFY(ARG) " timed out waiting for the SMU\n");     \
+			err = -1;                                                             \
 		} else {                                                                  \
 			printf("Failed to set" STRINGIFY(ARG) " \n");                         \
 			err = -1;                                                             \
@@ -131,6 +90,7 @@ static const char *family_name(enum ryzen_family fam)
 		case FAM_RENOIR: return "Renoir";
 		case FAM_CEZANNE: return "Cezanne";
 		case FAM_DALI: return "Dali";
+		case FAM_MENDOCINO: return "Mendocino";
 		case FAM_LUCIENNE: return "Lucienne";
 		case FAM_VANGOGH: return "Vangogh";
 		case FAM_REMBRANDT: return "Rembrandt";
@@ -168,52 +128,69 @@ static void show_info_table(ryzen_access ry)
 	//print table in github markdown
 	printf("|        Name         |   Value   |     Parameter      |\n");
 	printf("|---------------------|-----------|--------------------|\n");
-	char tableFormat[] = "| %-19s | %9.3lf | %-18s |\n";
-	printf(tableFormat, "STAPM LIMIT", get_stapm_limit(ry), "stapm-limit");
-	printf(tableFormat, "STAPM VALUE", get_stapm_value(ry), "");
-	printf(tableFormat, "PPT LIMIT FAST", get_fast_limit(ry), "fast-limit");
-	printf(tableFormat, "PPT VALUE FAST", get_fast_value(ry), "");
-	printf(tableFormat, "PPT LIMIT SLOW", get_slow_limit(ry), "slow-limit");
-	printf(tableFormat, "PPT VALUE SLOW", get_slow_value(ry), "");
-	printf(tableFormat, "StapmTimeConst", get_stapm_time(ry), "stapm-time");
-	printf(tableFormat, "SlowPPTTimeConst", get_slow_time(ry), "slow-time");
-	printf(tableFormat, "PPT LIMIT APU", get_apu_slow_limit(ry), "apu-slow-limit");
-	printf(tableFormat, "PPT VALUE APU", get_apu_slow_value(ry), "");
-	printf(tableFormat, "TDC LIMIT VDD", get_vrm_current(ry), "vrm-current");
-	printf(tableFormat, "TDC VALUE VDD", get_vrm_current_value(ry), "");
-	printf(tableFormat, "TDC LIMIT SOC", get_vrmsoc_current(ry), "vrmsoc-current");
-	printf(tableFormat, "TDC VALUE SOC", get_vrmsoc_current_value(ry), "");
-	printf(tableFormat, "EDC LIMIT VDD", get_vrmmax_current(ry), "vrmmax-current");
-	printf(tableFormat, "EDC VALUE VDD", get_vrmmax_current_value(ry), "");
-	printf(tableFormat, "EDC LIMIT SOC", get_vrmsocmax_current(ry), "vrmsocmax-current");
-	printf(tableFormat, "EDC VALUE SOC", get_vrmsocmax_current_value(ry), "");
-	printf(tableFormat, "THM LIMIT CORE", get_tctl_temp(ry), "tctl-temp");
-	printf(tableFormat, "THM VALUE CORE", get_tctl_temp_value(ry), "");
-	printf(tableFormat, "STT LIMIT APU", get_apu_skin_temp_limit(ry), "apu-skin-temp");
-	printf(tableFormat, "STT VALUE APU", get_apu_skin_temp_value(ry), "");
-	printf(tableFormat, "STT LIMIT dGPU", get_dgpu_skin_temp_limit(ry), "dgpu-skin-temp");
-	printf(tableFormat, "STT VALUE dGPU", get_dgpu_skin_temp_value(ry), "");
-	printf(tableFormat, "CCLK Boost SETPOINT", get_cclk_setpoint(ry), "power-saving /");
-	printf(tableFormat, "CCLK BUSY VALUE", get_cclk_busy_value(ry), "max-performance");
+#define tableFormat(NAME, VALUE, PARAM) \
+	printf("| %-19s | %9.3f | %-18s |\n", (NAME), (double)(VALUE), (PARAM))
+	tableFormat("STAPM LIMIT", get_stapm_limit(ry), "stapm-limit");
+	tableFormat("STAPM VALUE", get_stapm_value(ry), "");
+	tableFormat("PPT LIMIT FAST", get_fast_limit(ry), "fast-limit");
+	tableFormat("PPT VALUE FAST", get_fast_value(ry), "");
+	tableFormat("PPT LIMIT SLOW", get_slow_limit(ry), "slow-limit");
+	tableFormat("PPT VALUE SLOW", get_slow_value(ry), "");
+	tableFormat("StapmTimeConst", get_stapm_time(ry), "stapm-time");
+	tableFormat("SlowPPTTimeConst", get_slow_time(ry), "slow-time");
+	tableFormat("PPT LIMIT APU", get_apu_slow_limit(ry), "apu-slow-limit");
+	tableFormat("PPT VALUE APU", get_apu_slow_value(ry), "");
+	tableFormat("TDC LIMIT VDD", get_vrm_current(ry), "vrm-current");
+	tableFormat("TDC VALUE VDD", get_vrm_current_value(ry), "");
+	tableFormat("TDC LIMIT SOC", get_vrmsoc_current(ry), "vrmsoc-current");
+	tableFormat("TDC VALUE SOC", get_vrmsoc_current_value(ry), "");
+	tableFormat("EDC LIMIT VDD", get_vrmmax_current(ry), "vrmmax-current");
+	tableFormat("EDC VALUE VDD", get_vrmmax_current_value(ry), "");
+	tableFormat("EDC LIMIT SOC", get_vrmsocmax_current(ry), "vrmsocmax-current");
+	tableFormat("EDC VALUE SOC", get_vrmsocmax_current_value(ry), "");
+	tableFormat("THM LIMIT CORE", get_tctl_temp(ry), "tctl-temp");
+	tableFormat("THM VALUE CORE", get_tctl_temp_value(ry), "");
+	tableFormat("STT LIMIT APU", get_apu_skin_temp_limit(ry), "apu-skin-temp");
+	tableFormat("STT VALUE APU", get_apu_skin_temp_value(ry), "");
+	tableFormat("STT LIMIT dGPU", get_dgpu_skin_temp_limit(ry), "dgpu-skin-temp");
+	tableFormat("STT VALUE dGPU", get_dgpu_skin_temp_value(ry), "");
+	tableFormat("CCLK Boost SETPOINT", get_cclk_setpoint(ry), "power-saving /");
+	tableFormat("CCLK BUSY VALUE", get_cclk_busy_value(ry), "max-performance");
+#undef tableFormat
 }
 
 static void show_table_dump(ryzen_access ry, int any_adjust_applied)
 {
 	size_t index, table_size;
 	uint32_t *table_data_copy;
-	float *current_table_values, *old_table_values;
+	float *current_table_values, *old_table_values = NULL;
 
 	printf("PM Table Dump of Version: %x\n", get_table_ver(ry));
 	table_size = get_table_size(ry);
 
 	current_table_values = get_table_values(ry);
+	if (current_table_values == NULL || table_size < 4) {
+		printf("Power metric table is not available, nothing to dump\n");
+		return;
+	}
+
+	/* the old code used the malloc results without checking them */
 	table_data_copy = malloc(table_size);
+	if (table_data_copy == NULL) {
+		printf("Out of memory while dumping the power metric table\n");
+		return;
+	}
 	memcpy(table_data_copy, current_table_values, table_size);
 
 	if(any_adjust_applied)
 	{
 		//copy old values before refresh
 		old_table_values = malloc(table_size);
+		if (old_table_values == NULL) {
+			printf("Out of memory while dumping the power metric table\n");
+			free(table_data_copy);
+			return;
+		}
 		memcpy(old_table_values, table_data_copy, table_size);
 
 		int errorcode = refresh_table(ry);
@@ -224,10 +201,15 @@ static void show_table_dump(ryzen_access ry, int any_adjust_applied)
 		//print table in github markdown
 		printf("| Offset |    Data    |   Value   | After Adjust |\n");
 		printf("|--------|------------|-----------|--------------|\n");
-		char tableFormat[] = "| 0x%04X | 0x%08X | %9.3lf | %12.3lf |\n";
 		for(index = 0; index < table_size / 4; index++)
 		{
-			printf(tableFormat, index * 4, table_data_copy[index], old_table_values[index], current_table_values[index]);
+			/*
+			 * index is size_t; the previous "%04X" consumed only an unsigned
+			 * int from the varargs list, which is undefined behaviour on LP64.
+			 */
+			printf("| 0x%04zX | 0x%08" PRIX32 " | %9.3f | %12.3f |\n",
+			       index * 4, table_data_copy[index],
+			       (double)old_table_values[index], (double)current_table_values[index]);
 		}
 
 		free(old_table_values);
@@ -237,10 +219,10 @@ static void show_table_dump(ryzen_access ry, int any_adjust_applied)
 		//print table in github markdown
 		printf("| Offset |    Data    |   Value   |\n");
 		printf("|--------|------------|-----------|\n");
-		char tableFormat[] = "| 0x%04X | 0x%08X | %9.3lf |\n";
 		for(index = 0; index < table_size / 4; index++)
 		{
-			printf(tableFormat, index * 4, table_data_copy[index], current_table_values[index]);
+			printf("| 0x%04zX | 0x%08" PRIX32 " | %9.3f |\n",
+			       index * 4, table_data_copy[index], (double)current_table_values[index]);
 		}
 	}
 
@@ -257,13 +239,13 @@ int main(int argc, const char **argv)
 	int info = 0, dump_table = 0, any_adjust_applied = 0;
 	int power_saving = 0, max_performance = 0, enable_oc = 0x0, disable_oc = 0x0;
 	//init unsigned types with max value because we treat max value as unset
-	uint32_t stapm_limit = -1, fast_limit = -1, slow_limit = -1, slow_time = -1, stapm_time = -1, tctl_temp = -1;
-	uint32_t vrm_current = -1, vrmsoc_current = -1, vrmmax_current = -1, vrmsocmax_current = -1, psi0_current = -1, psi0soc_current = -1;
-	uint32_t vrmgfx_current = -1, vrmcvip_current = -1, vrmgfxmax_current = -1, psi3cpu_current = -1, psi3gfx_current = -1;
-	uint32_t max_socclk_freq = -1, min_socclk_freq = -1, max_fclk_freq = -1, min_fclk_freq = -1, max_vcn = -1, min_vcn = -1, max_lclk = -1, min_lclk = -1;
-	uint32_t max_gfxclk_freq = -1, min_gfxclk_freq = -1, prochot_deassertion_ramp = -1, apu_skin_temp_limit = -1, dgpu_skin_temp_limit = -1, apu_slow_limit = -1;
-	uint32_t skin_temp_power_limit = -1;
-	uint32_t gfx_clk = -1, oc_clk = -1, oc_volt = -1, coall = -1, coper = -1, cogfx = -1;
+	uint32_t stapm_limit = ARG_UNSET, fast_limit = ARG_UNSET, slow_limit = ARG_UNSET, slow_time = ARG_UNSET, stapm_time = ARG_UNSET, tctl_temp = ARG_UNSET;
+	uint32_t vrm_current = ARG_UNSET, vrmsoc_current = ARG_UNSET, vrmmax_current = ARG_UNSET, vrmsocmax_current = ARG_UNSET, psi0_current = ARG_UNSET, psi0soc_current = ARG_UNSET;
+	uint32_t vrmgfx_current = ARG_UNSET, vrmcvip_current = ARG_UNSET, vrmgfxmax_current = ARG_UNSET, psi3cpu_current = ARG_UNSET, psi3gfx_current = ARG_UNSET;
+	uint32_t max_socclk_freq = ARG_UNSET, min_socclk_freq = ARG_UNSET, max_fclk_freq = ARG_UNSET, min_fclk_freq = ARG_UNSET, max_vcn = ARG_UNSET, min_vcn = ARG_UNSET, max_lclk = ARG_UNSET, min_lclk = ARG_UNSET;
+	uint32_t max_gfxclk_freq = ARG_UNSET, min_gfxclk_freq = ARG_UNSET, prochot_deassertion_ramp = ARG_UNSET, apu_skin_temp_limit = ARG_UNSET, dgpu_skin_temp_limit = ARG_UNSET, apu_slow_limit = ARG_UNSET;
+	uint32_t skin_temp_power_limit = ARG_UNSET;
+	uint32_t gfx_clk = ARG_UNSET, oc_clk = ARG_UNSET, oc_volt = ARG_UNSET, coall = ARG_UNSET, coper = ARG_UNSET, cogfx = ARG_UNSET;
 
 	//create structure for parsing
 	struct argparse_option options[] = {
@@ -322,12 +304,18 @@ int main(int argc, const char **argv)
 	struct argparse argparse;
 	argparse_init(&argparse, options, usage, ARGPARSE_NON_OPTION_IS_INVALID);
 	argparse_describe(&argparse, "\n Ryzen Power Management adjust tool.", "\nWARNING: Use at your own risk!\nBy Jiaxun Yang <jiaxun.yang@flygoat.com>, Under LGPL.\nVersion: v" STRINGIFY(RYZENADJ_REVISION_VER) "." STRINGIFY(RYZENADJ_MAJOR_VER) "." STRINGIFY(RYZENADJ_MINIOR_VER));
-
-	/* Must run before argparse_parse(), which permutes argv in place. */
-	collect_coper_values(argc, argv);
-
 	argc = argparse_parse(&argparse, argc, argv);
 
+
+#ifndef _WIN32
+	/*
+	 * Not a hard failure: a CAP_SYS_RAWIO-only setup or a permissive
+	 * ryzen_smu sysfs can work without full root. But say so up front instead
+	 * of letting the user guess at "Unable to get os_access Obj".
+	 */
+	if (geteuid() != 0)
+		fprintf(stderr, "warning: not running as root, SMU access will most likely fail\n");
+#endif
 
 	//init RyzenAdj and validate that it was able to
 	ry = init_ryzenadj();
@@ -343,9 +331,12 @@ int main(int argc, const char **argv)
 
 	if (info || dump_table) {
 		//init before adjustment to get the default values
-		err = init_table(ry);
-		if (err) {
-			printf("Unable to init power metric table: %d, this does not affect adjustments because it is only needed for monitoring.\n", err);
+		int table_err = init_table(ry);
+		if (table_err) {
+			printf("Unable to init power metric table: %d, this does not affect adjustments because it is only needed for monitoring.\n", table_err);
+			//monitoring is unavailable, but adjustments below are still valid
+			info = 0;
+			dump_table = 0;
 		}
 	}
 
@@ -390,32 +381,7 @@ int main(int argc, const char **argv)
 	_do_enable(enable_oc)
 	_do_enable(disable_oc);
 	_do_adjust(coall);
-	if (coper_value_count > 1) {
-		for (int i = 0; i < coper_value_count; i++) {
-			uint32_t v = coper_values[i];
-			int adjerr = set_coper(ry, v);
-			if (!adjerr) {
-				any_adjust_applied = 1;
-				printf("Successfully set coper[%d] to %u\n", i, v);
-			} else if (adjerr == ADJ_ERR_FAM_UNSUPPORTED) {
-				printf("set_coper is not supported on this family\n");
-				err = -1;
-				break;
-			} else if (adjerr == ADJ_ERR_SMU_UNSUPPORTED) {
-				printf("set_coper is not supported on this SMU\n");
-				err = -1;
-				break;
-			} else if (adjerr == ADJ_ERR_SMU_REJECTED) {
-				printf("set_coper[%d] is rejected by SMU\n", i);
-				err = -1;
-			} else {
-				printf("Failed to set coper[%d]\n", i);
-				err = -1;
-			}
-		}
-	} else {
-		_do_adjust(coper);
-	}
+	_do_adjust(coper);
 	_do_adjust(cogfx);
 
 	if (!err) {

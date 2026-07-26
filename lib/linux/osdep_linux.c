@@ -5,7 +5,7 @@
 #include "osdep_linux_mem.h"
 #include "osdep_linux_smu_kernel_module.h"
 
-bool is_smu = false;
+static bool is_smu = false;
 
 static bool is_ryzen_smu_driver_compatible() {
 	FILE *drv_ver = fopen("/sys/kernel/ryzen_smu_drv/drv_version", "r");
@@ -16,7 +16,7 @@ static bool is_ryzen_smu_driver_compatible() {
 		return false;
 	}
 
-	ret = fscanf(drv_ver, "%d.%d.%d", &major, &minor, &patch);
+	ret = fscanf(drv_ver, "%9d.%9d.%9d", &major, &minor, &patch);
 	if (ret == EOF || ret < 3) {
 		DBG("failed to parse ryzen_smu version string\n");
 		fclose(drv_ver);
@@ -45,14 +45,19 @@ os_access_obj_t *init_os_access_obj() {
 	return init_os_access_obj_mem();
 }
 
-int init_mem_obj(os_access_obj_t *os_access, const uintptr_t physAddr) {
+int init_mem_obj(os_access_obj_t *os_access, const uintptr_t physAddr, const size_t size) {
 	if (is_smu)
-		return init_mem_obj_kmod(os_access, physAddr);
+		return init_mem_obj_kmod(os_access, physAddr, size);
 
-	return init_mem_obj_mem(os_access, physAddr);
+	return init_mem_obj_mem(os_access, physAddr, size);
 }
 
 void free_os_access_obj(os_access_obj_t *obj) {
+	if (obj == NULL) {
+		is_smu = false;
+		return;
+	}
+
 	if (is_smu)
 		free_os_access_obj_kmod(obj);
 	else

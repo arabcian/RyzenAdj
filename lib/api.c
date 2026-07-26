@@ -36,7 +36,8 @@ EXP ryzen_access CALL init_ryzenadj() {
 
 	ry->os_access = init_os_access_obj();
 	if(!ry->os_access){
-		printf("Unable to get os_access Obj, check permission\n");
+		printf("Unable to get os_access Obj, check permission (RyzenAdj needs to run as root)\n");
+		free(ry);
 		return NULL;
 	}
 
@@ -72,11 +73,17 @@ EXP void CALL cleanup_ryzenadj(ryzen_access ry) {
 
 EXP enum ryzen_family get_cpu_family(ryzen_access ry)
 {
+	if (!ry)
+		return FAM_UNKNOWN;
+
 	return ry->family;
 }
 
 EXP int get_bios_if_ver(ryzen_access ry)
 {
+	if(!ry)
+		return 0;
+
 	if(ry->bios_if_ver)
 		return ry->bios_if_ver;
 
@@ -88,7 +95,10 @@ EXP int get_bios_if_ver(ryzen_access ry)
 
 #define _return_translated_smu_error(SMU_RESP)                              \
 do {                                                                        \
-	if (SMU_RESP == REP_MSG_UnknownCmd) {                                   \
+	if (SMU_RESP == REP_MSG_Timeout) {                                      \
+		printf("%s timed out waiting for the SMU\n", __func__);           \
+		return ADJ_ERR_SMU_TIMEOUT;                                         \
+	} else if (SMU_RESP == REP_MSG_UnknownCmd) {                            \
 		printf("%s is unsupported\n", __func__);                            \
 		return ADJ_ERR_SMU_UNSUPPORTED;                                     \
 	} else if (SMU_RESP == REP_MSG_CmdRejectedPrereq){                      \
@@ -287,9 +297,32 @@ static int request_transfer_table(ryzen_access ry)
 	return 0;
 }
 
+static int init_table_locked(ryzen_access ry);
+
 EXP int CALL init_table(ryzen_access ry)
 {
 	DBG("init_table\n");
+	int errorcode = 0;
+
+	if (!ry)
+		return ADJ_ERR_MEMORY_ACCESS;
+
+	/*
+	 * init_table() is reachable both directly and from _lazy_init_table(),
+	 * which refresh_table() also uses. Without this guard an allocation
+	 * failure below sent the pair into unbounded mutual recursion.
+	 */
+	if (ry->table_init_busy)
+		return ADJ_ERR_MEMORY_ACCESS;
+	ry->table_init_busy = 1;
+
+	errorcode = init_table_locked(ry);
+	ry->table_init_busy = 0;
+	return errorcode;
+}
+
+static int init_table_locked(ryzen_access ry)
+{
 	int errorcode = 0;
 
 	errorcode = request_table_ver_and_size(ry);
@@ -302,8 +335,15 @@ EXP int CALL init_table(ryzen_access ry)
 		return errorcode;
 	}
 
+	//reject an implausible size before it is used to size an allocation or a mapping
+	if (ry->table_size == 0 || ry->table_size % 4 != 0 || ry->table_size > RYZENADJ_MAX_TABLE_SIZE) {
+		printf("Refusing implausible PM table size 0x%zx (table version %x)\n",
+		       ry->table_size, ry->table_ver);
+		return ADJ_ERR_MEMORY_ACCESS;
+	}
+
 	//init memory object because it is prerequiremt to woring with physical memory address
-	if (init_mem_obj(ry->os_access, ry->table_addr) < 0) {
+	if (init_mem_obj(ry->os_access, ry->table_addr, ry->table_size) < 0) {
 		printf("Unable to get memory access\n");
 		return ADJ_ERR_MEMORY_ACCESS;
 	}
@@ -313,7 +353,10 @@ EXP int CALL init_table(ryzen_access ry)
 	//especially for unknown table versions that fall back to the 0x1000 sentinel
 #ifndef _WIN32
 	if (is_using_smu_driver() &&
-	    ry->os_access->access.kmod.pm_table_size != ry->table_size) {
+	    ry->os_access->access.kmod.pm_table_size != ry->table_size &&
+	    ry->os_access->access.kmod.pm_table_size != 0 &&
+	    ry->os_access->access.kmod.pm_table_size % 4 == 0 &&
+	    ry->os_access->access.kmod.pm_table_size <= RYZENADJ_MAX_TABLE_SIZE) {
 		DBG("PM table size: using kmod value (%zu) over SMU-derived value (%zu)\n",
 		    ry->os_access->access.kmod.pm_table_size, ry->table_size);
 		ry->table_size = ry->os_access->access.kmod.pm_table_size;
@@ -321,7 +364,13 @@ EXP int CALL init_table(ryzen_access ry)
 #endif
 
 	//hold copy of table value in memory for our single value getters
+	//re-initialisation must not leak the previous buffer
+	free(ry->table_values);
 	ry->table_values = calloc(ry->table_size / 4, 4);
+	if (!ry->table_values) {
+		printf("Out of memory while allocating the power metric table\n");
+		return ADJ_ERR_MEMORY_ACCESS;
+	}
 
 	errorcode = refresh_table(ry);
 	if(errorcode)
@@ -370,12 +419,19 @@ EXP size_t CALL get_table_size(ryzen_access ry)
 
 EXP float* CALL get_table_values(ryzen_access ry)
 {
+	if (!ry)
+		return NULL;
+
 	return ry->table_values;
 }
 
 EXP int CALL refresh_table(ryzen_access ry)
 {
 	int errorcode = 0;
+
+	if (!ry)
+		return ADJ_ERR_MEMORY_ACCESS;
+
 	_lazy_init_table(errorcode);
 
 	//only execute request table if we don't use SMU driver
@@ -410,6 +466,8 @@ do {                                                 \
 	resp = smu_service_req(ry->mp1_smu, OPT, &args); \
 	if (resp == REP_MSG_OK) {                        \
 		err = 0;                                     \
+	} else if (resp == REP_MSG_Timeout) {            \
+		err = ADJ_ERR_SMU_TIMEOUT;                   \
 	} else if (resp == REP_MSG_UnknownCmd) {         \
 		err = ADJ_ERR_SMU_UNSUPPORTED;               \
 	} else {                                         \
@@ -426,6 +484,8 @@ do {                                                 \
 	resp = smu_service_req(ry->psmu, OPT, &args);    \
 	if (resp == REP_MSG_OK) {                        \
 		err = 0;                                     \
+	} else if (resp == REP_MSG_Timeout) {            \
+		err = ADJ_ERR_SMU_TIMEOUT;                   \
 	} else if (resp == REP_MSG_UnknownCmd) {         \
 		err = ADJ_ERR_SMU_UNSUPPORTED;               \
 	} else {                                         \
@@ -433,11 +493,24 @@ do {                                                 \
 	}                                                \
 } while (0);
 
-#define _read_float_value(OFFSET)                    \
-do {                                                 \
-	if(!ry->table_values)                            \
-		return NAN;                                  \
-	return ry->table_values[(OFFSET) / 4];           \
+/*
+ * Every single-value getter goes through here. The offsets are keyed off the
+ * PM table version reported by the SMU, while table_size can come from a
+ * different source (the ryzen_smu module, or the 0x1000 fallback used for
+ * unknown table versions). When the two disagree the old macro happily read
+ * past the end of the heap buffer. Bound every access instead.
+ */
+#define _read_float_value(OFFSET)                                        \
+do {                                                                     \
+	const size_t _off = (size_t)(OFFSET);                                \
+	if(!ry->table_values)                                                \
+		return NAN;                                                      \
+	if(_off + sizeof(float) > ry->table_size) {                          \
+		DBG("%s: offset 0x%zx out of range for table size 0x%zx\n",      \
+		    __func__, _off, ry->table_size);                             \
+		return NAN;                                                      \
+	}                                                                    \
+	return ry->table_values[_off / 4];                                   \
 } while (0);
 
 
@@ -607,10 +680,19 @@ EXP int CALL set_stapm_time(ryzen_access ry, uint32_t value){
 	case FAM_KRACKANPOINT:
 	case FAM_STRIXPOINT:
 	case FAM_STRIXHALO:
+		/*
+		 * Missing break: on every family in the group above, RyzenAdj sent
+		 * SMU message 0x18 (the correct STAPM time message) and then fell
+		 * through and *also* sent 0x4e - the Dragon Range / Fire Range
+		 * message ID - to the same MP1 mailbox, overwriting err with the
+		 * result of a command that was never meant for this silicon.
+		 */
 		_do_adjust(0x18);
+		break;
 	case FAM_DRAGONRANGE:
 	case FAM_FIRERANGE:
 		_do_adjust(0x4e);
+		break;
 	default:
 		break;
 	}
@@ -1460,6 +1542,7 @@ EXP int CALL set_cogfx(ryzen_access ry, uint32_t value) {
 		break;
 	case FAM_STRIXHALO:
 		// 0xB7 is rejected on this architecture
+		break;
 	default:
 		break;
 	}

@@ -20,6 +20,8 @@ struct _ryzen_access {
 	uint32_t table_ver;
 	size_t table_size;
 	float *table_values;
+	/* guards against init_table() <-> refresh_table() recursing forever */
+	int table_init_busy;
 };
 
 enum ryzen_family cpuid_get_family();

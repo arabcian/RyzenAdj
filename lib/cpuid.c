@@ -29,16 +29,22 @@ static enum ryzen_family cpuid_load_family()
 {
     uint32_t regs[4];
     int family, model;
-    char vendor[4 * 4];
+    char vendor[13];
 
     getcpuid(regs, 0);
 
-    /* Hack Alert! Put into str buffer */
-    *(uint32_t *) &vendor[0] = regs[1];
-    *(uint32_t *) &vendor[4] = regs[3];
-    *(uint32_t *) &vendor[8] = regs[2];
+    /*
+     * memcpy instead of type-punning through a char* cast: the old
+     * `*(uint32_t *)&vendor[0] = ...` form violates strict aliasing and can be
+     * miscompiled under -O2 with LTO (which this project enables by default).
+     * Also NUL-terminate so the buffer is a real string.
+     */
+    memcpy(&vendor[0], &regs[1], 4);
+    memcpy(&vendor[4], &regs[3], 4);
+    memcpy(&vendor[8], &regs[2], 4);
+    vendor[12] = '\0';
 
-    if (strncmp(vendor, CPUID_VENDOR_AMD, strlen(CPUID_VENDOR_AMD))) {
+    if (strcmp(vendor, CPUID_VENDOR_AMD)) {
         printf("Not AMD processor, must be kidding\n");
         return FAM_UNKNOWN;
     }
@@ -106,6 +112,7 @@ static enum ryzen_family cpuid_load_family()
             printf("Fam%xh: unsupported model %d\n", family, model);
             break;
         }
+        break;
 
     default:
         printf("Unsupported family: %xh\n", family);
