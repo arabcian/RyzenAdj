@@ -24,14 +24,20 @@
  */
 #define ARG_UNSET UINT32_MAX
 
-#define _do_adjust(ARG) \
+/*
+ * Curve Optimiser offsets are signed on the command line and unsigned on the
+ * wire, so they are kept in an int64_t with a sentinel that cannot collide
+ * with a real offset (-1 is a valid offset; UINT32_MAX is not usable here).
+ */
+#define CO_UNSET INT64_MIN
+
+#define _do_adjust_ex(ARG, COND, VALUE, FMT, ...) \
 do {                                                                              \
-	/* ignore max unsigned integer values */                                      \
-	if (ARG != ARG_UNSET) {                                                              \
-		int adjerr = set_##ARG(ry, ARG);                                          \
+	if (COND) {                                                                   \
+		int adjerr = set_##ARG(ry, VALUE);                                        \
 		if (!adjerr){                                                             \
 			any_adjust_applied = 1;                                               \
-			printf("Successfully set " STRINGIFY(ARG) " to %u\n", ARG);            \
+			printf("Successfully set " STRINGIFY(ARG) " to " FMT "\n", __VA_ARGS__); \
 		} else if (adjerr == ADJ_ERR_FAM_UNSUPPORTED) {                           \
 			printf("set_" STRINGIFY(ARG) " is not supported on this family\n");   \
 			err = -1;                                                             \
@@ -50,6 +56,19 @@ do {                                                                            
 		}                                                                         \
 	}                                                                             \
 } while(0);
+
+/* ignore max unsigned integer values */
+#define _do_adjust(ARG) _do_adjust_ex(ARG, (ARG) != ARG_UNSET, ARG, "%u", ARG)
+
+/*
+ * Curve Optimiser words are passed to the SMU verbatim, so print the exact
+ * 32 bit pattern that was sent alongside what the user typed.
+ */
+#define _do_adjust_co(ARG) \
+	_do_adjust_ex(ARG, (ARG) != CO_UNSET,                                       \
+		      (uint32_t)((uint64_t)(ARG) & 0xFFFFFFFFULL), "%lld (0x%08llX)", \
+		      (long long)(ARG),                                             \
+		      (unsigned long long)((uint64_t)(ARG) & 0xFFFFFFFFULL))
 
 #define _do_enable(ARG) \
 do {                                                                              \
@@ -245,7 +264,8 @@ int main(int argc, const char **argv)
 	uint32_t max_socclk_freq = ARG_UNSET, min_socclk_freq = ARG_UNSET, max_fclk_freq = ARG_UNSET, min_fclk_freq = ARG_UNSET, max_vcn = ARG_UNSET, min_vcn = ARG_UNSET, max_lclk = ARG_UNSET, min_lclk = ARG_UNSET;
 	uint32_t max_gfxclk_freq = ARG_UNSET, min_gfxclk_freq = ARG_UNSET, prochot_deassertion_ramp = ARG_UNSET, apu_skin_temp_limit = ARG_UNSET, dgpu_skin_temp_limit = ARG_UNSET, apu_slow_limit = ARG_UNSET;
 	uint32_t skin_temp_power_limit = ARG_UNSET;
-	uint32_t gfx_clk = ARG_UNSET, oc_clk = ARG_UNSET, oc_volt = ARG_UNSET, coall = ARG_UNSET, coper = ARG_UNSET, cogfx = ARG_UNSET;
+	uint32_t gfx_clk = ARG_UNSET, oc_clk = ARG_UNSET, oc_volt = ARG_UNSET;
+	int64_t coall = CO_UNSET, coper = CO_UNSET, cogfx = CO_UNSET;
 
 	//create structure for parsing
 	struct argparse_option options[] = {
@@ -291,9 +311,9 @@ int main(int argc, const char **argv)
 		OPT_U32('\0', "oc-volt", &oc_volt, "Forced Core VID: Must follow this calculation (1.55 - [VID you want to set e.g. 1.25 for 1.25v]) / 0.00625 (Renoir and up Only)"),
 		OPT_BOOLEAN('\0', "enable-oc", &enable_oc, "Enable OC (Renoir and up Only)"),
 		OPT_BOOLEAN('\0', "disable-oc", &disable_oc, "Disable OC (Renoir and up Only)"),
-		OPT_U32('\0', "set-coall", &coall, "All core Curve Optimiser"),
-		OPT_U32('\0', "set-coper", &coper, "Per core Curve Optimiser"),
-		OPT_U32('\0', "set-cogfx", &cogfx, "iGPU Curve Optimiser"),
+		OPT_CO32('\0', "set-coall", &coall, "All core Curve Optimiser - raw 32 bit word, sent to the SMU unchanged (e.g. 0x100000-20 for -20)"),
+		OPT_CO32('\0', "set-coper", &coper, "Per core Curve Optimiser - raw 32 bit word, core index in the upper bits"),
+		OPT_CO32('\0', "set-cogfx", &cogfx, "iGPU Curve Optimiser - raw 32 bit word, sent to the SMU unchanged"),
 		OPT_BOOLEAN('\0', "power-saving", &power_saving, "Hidden options to improve power efficiency (is set when AC unplugged): behavior depends on CPU generation, Device and Manufacture"),
 		OPT_BOOLEAN('\0', "max-performance", &max_performance, "Hidden options to improve performance (is set when AC plugged in): behavior depends on CPU generation, Device and Manufacture"),
 		OPT_GROUP("P-State Functions"),
@@ -380,9 +400,9 @@ int main(int argc, const char **argv)
 	_do_enable(max_performance);
 	_do_enable(enable_oc)
 	_do_enable(disable_oc);
-	_do_adjust(coall);
-	_do_adjust(coper);
-	_do_adjust(cogfx);
+	_do_adjust_co(coall);
+	_do_adjust_co(coper);
+	_do_adjust_co(cogfx);
 
 	if (!err) {
 		//call show table dump before anybody did call table refresh, because we want to copy the old values first

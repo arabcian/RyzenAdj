@@ -15,6 +15,15 @@
 #include <stdint.h>
 #include "argparse.h"
 
+/*
+ * Curve Optimiser values are raw 32 bit words: RyzenAdj performs no arithmetic
+ * on them, the value lands in the SMU mailbox argument register unchanged
+ * (lib/api.c: args.arg0 = value). The caller supplies the already-encoded
+ * two's complement word, so the only job here is to reproduce upstream's
+ * strtoul() bit pattern without the silent wrap-around on out-of-range input.
+ */
+#define CO32_LIMIT (1LL << 32)
+
 #define OPT_UNSET 1
 #define OPT_LONG  (1 << 1)
 
@@ -187,6 +196,60 @@ argparse_getvalue(struct argparse *self, const struct argparse_option *opt,
 		*(uint32_t *)opt->value = (uint32_t)uval;
 		break;
 	}
+	case ARGPARSE_OPT_CO32: {
+		const char *raw = NULL;
+		const char *scan;
+
+		if (self->optvalue) {
+			raw = self->optvalue;
+			self->optvalue = NULL;
+		} else if (self->argc > 1) {
+			self->argc--;
+			raw = *++self->argv;
+		} else {
+			argparse_error(self, opt, "requires a value", flags);
+		}
+
+		if (raw == NULL || raw[0] == '\0')
+			argparse_error(self, opt, "requires a value", flags);
+
+		scan = raw;
+		while (isspace((unsigned char)*scan))
+			scan++;
+
+		errno = 0;
+
+		if (*scan == '-') {
+			/*
+			 * Curve Optimiser offsets are genuinely signed: "--set-coall=-20"
+			 * is the normal undervolt case. The value handed to the SMU is the
+			 * two's complement 32-bit pattern, which is what the old strtoul()
+			 * wrap-around produced by accident; here it is deliberate.
+			 */
+			const long long sval = strtoll(raw, (char **)&s, 0);
+
+			if (errno)
+				argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
+			if (s == raw || s[0] != '\0')
+				argparse_error(self, opt, "expects an integer value", flags);
+			if (sval <= -CO32_LIMIT)
+				argparse_error(self, opt, "value does not fit in 32 bits", flags);
+
+			*(int64_t *)opt->value = sval;
+		} else {
+			const unsigned long uval = strtoul(raw, (char **)&s, 0);
+
+			if (errno)
+				argparse_error(self, opt, safe_strerror(errno, buf, sizeof(buf)), flags);
+			if (s == raw || s[0] != '\0')
+				argparse_error(self, opt, "expects an integer value", flags);
+			if (uval > UINT32_MAX)
+				argparse_error(self, opt, "value is out of range for a 32-bit unsigned integer", flags);
+
+			*(int64_t *)opt->value = (int64_t)uval;
+		}
+		break;
+	}
 	case ARGPARSE_OPT_FLOAT: {
 		const char *raw = NULL;
 		float fval;
@@ -236,6 +299,7 @@ argparse_options_check(const struct argparse_option *options)
 		case ARGPARSE_OPT_BIT:
 		case ARGPARSE_OPT_INTEGER:
 		case ARGPARSE_OPT_U32:
+		case ARGPARSE_OPT_CO32:
 		case ARGPARSE_OPT_FLOAT:
 		case ARGPARSE_OPT_STRING:
 		case ARGPARSE_OPT_GROUP:
@@ -433,6 +497,9 @@ argparse_usage(struct argparse *self)
 		if (options->type == ARGPARSE_OPT_U32) {
 			len += strlen("=<u32>");
 		}
+		if (options->type == ARGPARSE_OPT_CO32) {
+			len += strlen("=<int>");
+		}
 		if (options->type == ARGPARSE_OPT_FLOAT) {
 			len += strlen("=<flt>");
 		} else if (options->type == ARGPARSE_OPT_STRING) {
@@ -469,6 +536,8 @@ argparse_usage(struct argparse *self)
 			pos += fprintf(stdout, "=<int>");
 		} else if (options->type == ARGPARSE_OPT_U32) {
 			pos += fprintf(stdout, "=<u32>");
+		} else if (options->type == ARGPARSE_OPT_CO32) {
+			pos += fprintf(stdout, "=<int>");
 		} else if (options->type == ARGPARSE_OPT_FLOAT) {
 			pos += fprintf(stdout, "=<flt>");
 		} else if (options->type == ARGPARSE_OPT_STRING) {

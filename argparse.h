@@ -36,6 +36,13 @@ enum argparse_option_type {
 	/* options with arguments (optional or required) */
 	ARGPARSE_OPT_INTEGER,
 	ARGPARSE_OPT_U32,
+	/*
+	 * Curve Optimiser offsets: unsigned on the wire (the SMU takes a two's
+	 * complement value) but signed on the command line, so "-20" has to be
+	 * accepted. Stored into an int64_t so that the "unset" sentinel cannot
+	 * collide with a legitimate -1.
+	 */
+	ARGPARSE_OPT_CO32,
 	ARGPARSE_OPT_FLOAT,
 	ARGPARSE_OPT_STRING,
 };
@@ -112,6 +119,7 @@ int argparse_help_cb(struct argparse *self,
 #define OPT_BIT(...)     { ARGPARSE_OPT_BIT, __VA_ARGS__ }
 #define OPT_INTEGER(...) { ARGPARSE_OPT_INTEGER, __VA_ARGS__ }
 #define OPT_U32(...) { ARGPARSE_OPT_U32, __VA_ARGS__ }
+#define OPT_CO32(...) { ARGPARSE_OPT_CO32, __VA_ARGS__ }
 #define OPT_FLOAT(...)   { ARGPARSE_OPT_FLOAT, __VA_ARGS__ }
 #define OPT_STRING(...)  { ARGPARSE_OPT_STRING, __VA_ARGS__ }
 #define OPT_GROUP(h)     { ARGPARSE_OPT_GROUP, 0, NULL, NULL, h, NULL, 0, 0 }

@@ -105,8 +105,19 @@ os_access_obj_t *init_os_access_obj_kmod() {
 	obj->access.kmod.smn_fd = -1;
 	obj->access.kmod.pm_table_fd = -1;
 
-	if (get_pm_table_size(&obj->access.kmod.pm_table_size) != 0)
-		goto err_exit;
+	/*
+	 * Only the SMN/mailbox interface is mandatory: that is what every
+	 * adjustment (--fast-limit, --stapm-limit, undervolting, ...) goes
+	 * through.  The PM table is telemetry only (--info / --dump-table) and
+	 * ryzen_smu does not create the pm_table* attributes at all when it
+	 * cannot resolve the DRAM base address for the running CPU.  Treat a
+	 * missing/unreadable PM table as "no telemetry", not as a fatal init
+	 * error, otherwise RyzenAdj refuses to do the one thing it can still do.
+	 */
+	if (get_pm_table_size(&obj->access.kmod.pm_table_size) != 0) {
+		DBG("continuing without PM table support (telemetry unavailable)\n");
+		obj->access.kmod.pm_table_size = 0;
+	}
 
 	obj->access.kmod.smn_fd = open("/sys/kernel/ryzen_smu_drv/smn", O_RDWR | O_CLOEXEC);
 	if (obj->access.kmod.smn_fd == -1) {
@@ -114,11 +125,13 @@ os_access_obj_t *init_os_access_obj_kmod() {
 		goto err_exit;
 	}
 
-	obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table", O_RDONLY | O_CLOEXEC);
-	if (obj->access.kmod.pm_table_fd == -1) {
-		DBG("failed to open pm_table fd: %s\n", strerror(errno));
-		close(obj->access.kmod.smn_fd);
-		goto err_exit;
+	if (obj->access.kmod.pm_table_size != 0) {
+		obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table",
+						    O_RDONLY | O_CLOEXEC);
+		if (obj->access.kmod.pm_table_fd == -1) {
+			DBG("failed to open pm_table fd: %s\n", strerror(errno));
+			obj->access.kmod.pm_table_size = 0;
+		}
 	}
 
 	return obj;
@@ -180,11 +193,17 @@ void smn_reg_write_kmod(const os_access_obj_t *obj, const uint32_t addr, const u
 		return;
 	}
 
-	if (write_full(obj->access.kmod.smn_fd, write_buffer, sizeof(write_buffer)) != 0)
+	if (write_full(obj->access.kmod.smn_fd, write_buffer, sizeof(write_buffer)) != 0) {
 		DBG("%s: error: %s\n", __func__, strerror(errno));
+	}
 }
 
 int copy_pm_table_kmod(const os_access_obj_t *obj, void *buffer, const size_t size) {
+	if (obj->access.kmod.pm_table_fd < 0 || obj->access.kmod.pm_table_size == 0) {
+		DBG("PM table is not exported by ryzen_smu on this system\n");
+		return -1;
+	}
+
 	if (obj->access.kmod.pm_table_size < size) {
 		DBG("PM table size too small: ryzenadj (%zu) | ryzen_smu (%zu)\n", size, obj->access.kmod.pm_table_size);
 		return -1;
