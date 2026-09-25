@@ -8,6 +8,9 @@
 #else
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/file.h>
 #endif
 
 #include "ryzenadj.h"
@@ -74,6 +77,63 @@ static void short_sleep(void)
 }
 
 /*
+ * Cross-process mailbox lock.
+ *
+ * An SMU request is ~15 separate SMN accesses (clear rsp, 6 args, msg id,
+ * poll, 6 read-backs). With the ryzen_smu backend every access is its own
+ * write()+read() on the shared "smn" attribute and the driver keeps the
+ * selected SMN address globally, so two RyzenAdj users running at once (CLI +
+ * a power-manager daemon linking libryzenadj, an ACPI/udev hook, ...) can
+ * interleave: one process's arguments get attached to the other's message
+ * id, and register reads return values for the other process's address.
+ * Serialise whole transactions with an advisory flock. Waiting is bounded;
+ * if the lock cannot be taken we fail instead of racing.
+ */
+#ifndef _WIN32
+#define SMU_LOCK_PATH "/run/lock/ryzenadj.lock"
+#define SMU_LOCK_TIMEOUT_MS 2000
+
+static int smu_lock_fd = -1;
+
+static uint64_t monotonic_ms(void);
+
+static int smu_lock(void)
+{
+	uint64_t deadline;
+
+	if (smu_lock_fd < 0) {
+		smu_lock_fd = open(SMU_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+		if (smu_lock_fd < 0) {
+			/* /run/lock missing or read-only: run unlocked, like upstream */
+			DBG("smu lock: open %s failed: %d\n", SMU_LOCK_PATH, errno);
+			return 0;
+		}
+	}
+
+	deadline = monotonic_ms() + SMU_LOCK_TIMEOUT_MS;
+	while (flock(smu_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+		if (errno != EWOULDBLOCK && errno != EINTR)
+			return 0; /* flock unsupported here; don't block the user */
+		if (monotonic_ms() >= deadline) {
+			fprintf(stderr, "SMU mailbox busy: another RyzenAdj user holds %s\n", SMU_LOCK_PATH);
+			return -1;
+		}
+		usleep(1000);
+	}
+	return 0;
+}
+
+static void smu_unlock(void)
+{
+	if (smu_lock_fd >= 0)
+		flock(smu_lock_fd, LOCK_UN);
+}
+#else
+static int smu_lock(void) { return 0; }
+static void smu_unlock(void) {}
+#endif
+
+/*
  * Wait for the SMU to write its response register.
  *
  * The previous implementation was an unbounded `while (response == 0)` spin.
@@ -111,6 +171,17 @@ uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args)
 	DBG("SMU_SERVICE REQ: arg0: 0x%x, arg1:0x%x, arg2:0x%x, arg3:0x%x, arg4: 0x%x, arg5: 0x%x\n",  \
 		args->arg0, args->arg1, args->arg2, args->arg3, args->arg4, args->arg5);
 
+	if (smu_lock() != 0)
+		return REP_MSG_CmdRejectedBusy;
+
+	/* Preferred: let ryzen_smu run the transaction under its own SMU mutex */
+	if (smu_raw_cmd(smu->os_access, smu->msg, smu->rep, smu->arg_base, id, args, &response) == 0) {
+		smu_unlock();
+		DBG("SMU_SERVICE REP (raw_cmd): REP: 0x%x, arg0: 0x%x\n", response, args->arg0);
+		return response;
+	}
+
+	(void)smn_io_take_error();
 	/* Clear the response */
 	smn_reg_write(smu->os_access, smu->rep, 0x0);
 	/* Pass arguments */
@@ -120,12 +191,25 @@ uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args)
 	smn_reg_write(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 3), args->arg3);
 	smn_reg_write(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 4), args->arg4);
 	smn_reg_write(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 5), args->arg5);
+	/*
+	 * Never ring the doorbell if a setup write failed: the SMU would run
+	 * the command with whatever the previous transaction left in the
+	 * argument registers (a stale CO word or power limit, for example).
+	 */
+	if (smn_io_take_error()) {
+		fprintf(stderr, "SMU request 0x%x aborted: SMN write failed, message not sent\n", id);
+		smu_unlock();
+		return REP_MSG_Failed;
+	}
 	/* Send message ID */
 	smn_reg_write(smu->os_access, smu->msg, id);
 	/* Wait until response changed (bounded) */
 	response = smu_wait_for_response(smu);
-	if (response == REP_MSG_Timeout)
+	if (response == REP_MSG_Timeout) {
+		(void)smn_io_take_error();
+		smu_unlock();
 		return REP_MSG_Timeout;
+	}
 	/* Read back arguments */
 	args->arg0 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 0));
 	args->arg1 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 1));
@@ -133,6 +217,12 @@ uint32_t smu_service_req(smu_t smu, const uint32_t id, smu_service_args_t *args)
 	args->arg3 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 3));
 	args->arg4 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 4));
 	args->arg5 = smn_reg_read(smu->os_access, c2pmsg_argX_addr(smu->arg_base, 5));
+	if (smn_io_take_error() && response == REP_MSG_OK) {
+		/* the command ran, but the returned values can't be trusted */
+		fprintf(stderr, "SMU request 0x%x: reading result registers failed\n", id);
+		response = REP_MSG_Failed;
+	}
+	smu_unlock();
 
 	DBG("SMU_SERVICE REP: REP: 0x%x, arg0: 0x%x, arg1:0x%x, arg2:0x%x, arg3:0x%x, arg4: 0x%x, arg5: 0x%x\n",  \
 		response, args->arg0, args->arg1, args->arg2, args->arg3, args->arg4, args->arg5);
@@ -144,11 +234,25 @@ static int smu_service_test(smu_t smu)
 {
 	uint32_t response;
 
+	if (smu_lock() != 0)
+		return 0;
+
+	{
+		smu_service_args_t targs = { 0x47, 0, 0, 0, 0, 0 };
+
+		if (smu_raw_cmd(smu->os_access, smu->msg, smu->rep, smu->arg_base,
+				SMU_TEST_MSG, &targs, &response) == 0) {
+			smu_unlock();
+			return response == REP_MSG_OK;
+		}
+	}
+
 	/* Clear the response */
 	smn_reg_write(smu->os_access, smu->rep, 0x0);
 	/* Test message with unique argument */
 	smn_reg_write(smu->os_access, smu->arg_base, 0x47);
 	if(smn_reg_read(smu->os_access, smu->arg_base) != 0x47){
+		smu_unlock();
 		printf("PCI Bus is not writeable, check secure boot\n");
 		return 0;
 	}
@@ -157,6 +261,8 @@ static int smu_service_test(smu_t smu)
 	smn_reg_write(smu->os_access, smu->msg, SMU_TEST_MSG);
 	/* Wait until response changed (bounded) */
 	response = smu_wait_for_response(smu);
+	(void)smn_io_take_error();
+	smu_unlock();
 	if (response == REP_MSG_Timeout) {
 		DBG("SMU test message timed out\n");
 		return 0;

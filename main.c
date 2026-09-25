@@ -51,11 +51,11 @@ do {                                                                            
 			printf("set_" STRINGIFY(ARG) " timed out waiting for the SMU\n");     \
 			err = -1;                                                             \
 		} else {                                                                  \
-			printf("Failed to set" STRINGIFY(ARG) " \n");                         \
+			printf("Failed to set " STRINGIFY(ARG) "\n");                         \
 			err = -1;                                                             \
 		}                                                                         \
 	}                                                                             \
-} while(0);
+} while(0)
 
 /* ignore max unsigned integer values */
 #define _do_adjust(ARG) _do_adjust_ex(ARG, (ARG) != ARG_UNSET, ARG, "%u", ARG)
@@ -90,11 +90,11 @@ do {                                                                            
 			printf("set_" STRINGIFY(ARG) " timed out waiting for the SMU\n");     \
 			err = -1;                                                             \
 		} else {                                                                  \
-			printf("Failed to set" STRINGIFY(ARG) " \n");                         \
+			printf("Failed to set " STRINGIFY(ARG) "\n");                         \
 			err = -1;                                                             \
 		}                                                                         \
 	}                                                                             \
-} while(0);
+} while(0)
 
 static const char *const usage[] = {
 	"ryzenadj [options]",
@@ -326,6 +326,15 @@ int main(int argc, const char **argv)
 	argparse_describe(&argparse, "\n Ryzen Power Management adjust tool.", "\nWARNING: Use at your own risk!\nBy Jiaxun Yang <jiaxun.yang@flygoat.com>, Under LGPL.\nVersion: v" STRINGIFY(RYZENADJ_REVISION_VER) "." STRINGIFY(RYZENADJ_MAJOR_VER) "." STRINGIFY(RYZENADJ_MINIOR_VER));
 	argc = argparse_parse(&argparse, argc, argv);
 
+	if (power_saving && max_performance) {
+		fprintf(stderr, "--power-saving and --max-performance are mutually exclusive\n");
+		return -1;
+	}
+	if (enable_oc && disable_oc) {
+		fprintf(stderr, "--enable-oc and --disable-oc are mutually exclusive\n");
+		return -1;
+	}
+
 
 #ifndef _WIN32
 	/*
@@ -394,12 +403,13 @@ int main(int argc, const char **argv)
 	_do_adjust(apu_slow_limit);
 	_do_adjust(skin_temp_power_limit);
 	_do_adjust(gfx_clk);
+	/* OC mode has to be on before the SMU accepts OC clock/voltage */
+	_do_enable(enable_oc);
 	_do_adjust(oc_clk);
 	_do_adjust(oc_volt);
+	_do_enable(disable_oc);
 	_do_enable(power_saving);
 	_do_enable(max_performance);
-	_do_enable(enable_oc)
-	_do_enable(disable_oc);
 	_do_adjust_co(coall);
 	_do_adjust_co(coper);
 	_do_adjust_co(cogfx);

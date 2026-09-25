@@ -73,6 +73,7 @@ typedef struct {
 		struct {
 			int smn_fd;
 			int pm_table_fd;
+			int raw_cmd_fd; /* ryzen_smu >= 0.1.9 smu_raw_cmd, -1 if absent */
 			size_t pm_table_size;
 		} kmod;
 	} access;
@@ -105,6 +106,20 @@ void free_os_access_obj(os_access_obj_t *obj);
 
 uint32_t smn_reg_read(const os_access_obj_t *obj, uint32_t addr);
 void smn_reg_write(const os_access_obj_t *obj, uint32_t addr, uint32_t data);
+/*
+ * Returns non-zero if any smn_reg_read/smn_reg_write failed since the last
+ * call, and clears the flag. smn_reg_write() is void for ABI reasons, so this
+ * is how a failed argument write is detected before the message id is sent.
+ */
+int smn_io_take_error(void);
+/*
+ * Run a whole mailbox transaction in the backend if it can do so atomically
+ * (ryzen_smu smu_raw_cmd). Returns 0 and fills *response/args when it ran,
+ * -1 when the backend has no such interface and the caller must fall back to
+ * driving the registers itself.
+ */
+int smu_raw_cmd(const os_access_obj_t *obj, uint32_t msg, uint32_t rep, uint32_t arg_base,
+		uint32_t id, smu_service_args_t *args, uint32_t *response);
 bool is_using_smu_driver();
 
 smu_t get_smu(os_access_obj_t *obj, int smu_type);

@@ -5,6 +5,8 @@
 
 #include "../nb_smu_ops.h"
 
+void smn_io_set_error(void);
+
 os_access_obj_t *init_os_access_obj_mem();
 int init_mem_obj_mem(os_access_obj_t *os_access, uintptr_t physAddr, size_t size);
 int copy_pm_table_mem(const os_access_obj_t *obj, void *buffer, size_t size);

@@ -4,6 +4,10 @@
 
 #ifndef RYZENADJ_H
 #define RYZENADJ_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -66,7 +70,7 @@ struct _ryzen_access;
 
 typedef struct _ryzen_access *ryzen_access;
 
-EXP ryzen_access CALL init_ryzenadj();
+EXP ryzen_access CALL init_ryzenadj(void);
 
 EXP void CALL cleanup_ryzenadj(ryzen_access ry);
 

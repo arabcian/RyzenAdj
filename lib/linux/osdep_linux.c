@@ -6,6 +6,25 @@
 #include "osdep_linux_smu_kernel_module.h"
 
 static bool is_smu = false;
+static int smn_io_error;
+
+void smn_io_set_error(void) { smn_io_error = 1; }
+
+int smu_raw_cmd(const os_access_obj_t *obj, const uint32_t msg, const uint32_t rep,
+		const uint32_t arg_base, const uint32_t id, smu_service_args_t *args,
+		uint32_t *response)
+{
+	if (!is_smu)
+		return -1;
+	return smu_raw_cmd_kmod(obj, msg, rep, arg_base, id, args, response);
+}
+
+int smn_io_take_error(void)
+{
+	const int e = smn_io_error;
+	smn_io_error = 0;
+	return e;
+}
 
 static bool is_ryzen_smu_driver_compatible() {
 	FILE *drv_ver = fopen("/sys/kernel/ryzen_smu_drv/drv_version", "r");

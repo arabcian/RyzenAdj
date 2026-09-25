@@ -152,3 +152,34 @@ Sıkılaştırmayı kapatmak için: `-DRYZENADJ_HARDENING=OFF`.
   değiştirilmedi.
 - **`smu_service_test()` "PCI Bus is not writeable" mesajı** MP1 ve PSMU için iki kez basılıyor.
   Çıktıyı ayrıştıran script'leri bozmamak için dokunulmadı.
+
+---
+
+## 2. tur (Eylül 2026)
+
+- **SMU mailbox yarış durumu (kritik):** Bir SMU isteği ~15 ayrı SMN erişimi; ryzen_smu
+  backend'inde seçili SMN adresi sürücüde global tutuluyor. Aynı anda iki RyzenAdj kullanıcısı
+  (CLI + libryzenadj kullanan daemon) argümanlarını birbirinin mesaj ID'sine karıştırabiliyordu.
+  Sahte-SMU testinde 3 süreç × 200 istekte orijinal kod 599 çapraz işlem üretti, yeni kod 0.
+  Çözüm: `/run/lock/ryzenadj.lock` üzerinde tüm transaction'ı kapsayan `flock`, 2 sn sınırlı
+  bekleme; kilit alınamazsa `REP_MSG_CmdRejectedBusy` (yarışmak yerine hata).
+- **Sessiz SMN yazma hataları:** `smn_reg_write()` void olduğu için bir argüman yazması başarısız
+  olsa bile mesaj ID'si gönderiliyordu → SMU önceki işlemden kalan argümanla (ör. eski CO word'ü)
+  çalışıyordu. Artık hata bayrağı (`smn_io_take_error`) kontrol ediliyor, doorbell çalınmıyor.
+  Sonuç okuma hatasında da `REP_MSG_OK` döndürülmüyor.
+- `get_bios_if_ver()` SMU yanıtını yok sayıp timeout'ta çöp/0 değeri döndürüyordu; düzeltildi.
+- `ryzenadj.h` kendi kendine yeterli değildi (stdint/stddef olmadan derlenmiyordu);
+  `init_ryzenadj()` → `init_ryzenadj(void)`.
+- main.c: `--enable-oc` artık `--oc-clk/--oc-volt`'tan önce uygulanıyor; çelişen bayraklar
+  (`--power-saving`+`--max-performance`, `--enable-oc`+`--disable-oc`) reddediliyor;
+  `"Failed to setfast_limit"` boşluk hatası; makrolardaki `while(0);` idiom hatası.
+
+## 3. tur — ryzen_smu 0.1.9 entegrasyonu
+
+- ryzen_smu `smu_raw_cmd` sunuyorsa `smu_service_req()` / `smu_service_test()` tüm işlemi
+  sürücüye bırakır (sürücünün SMU mutex'i altında, atomik). Yoksa (eski sürücü, /dev/mem,
+  Windows) önceki SMN register yolu + flock kullanılır; sürücü adresi reddederse (EINVAL)
+  otomatik geri düşer.
+- Durum eşlemesi: SMU kodları aynen; sürücü timeout (0xFB) → `REP_MSG_Timeout`;
+  PCI/iç hata → `REP_MSG_Failed`; `-EAGAIN` → `REP_MSG_CmdRejectedBusy`. Argümanlar yalnızca
+  `OK` yanıtında güncellenir. Yazma sonrası belirsiz durumda komut asla tekrar gönderilmez.

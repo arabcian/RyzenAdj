@@ -103,6 +103,15 @@ void smn_reg_write(const os_access_obj_t *obj, uint32_t addr, uint32_t data) {
     WritePciConfigDword(obj->pci_address, NB_PCI_REG_DATA_ADDR, data);
 }
 
+int smu_raw_cmd(const os_access_obj_t *, uint32_t, uint32_t, uint32_t, uint32_t,
+                smu_service_args_t *, uint32_t *) {
+    return -1;
+}
+
+int smn_io_take_error(void) {
+    return 0; /* inpout reports no errors */
+}
+
 int init_mem_obj(os_access_obj_t *os_access, uintptr_t physAddr, size_t size) {
     HINSTANCE hInpOutDll = LoadLibrary ("inpoutx64.DLL");
 

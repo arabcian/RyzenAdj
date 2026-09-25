@@ -104,6 +104,7 @@ os_access_obj_t *init_os_access_obj_kmod() {
 	memset(obj, 0, sizeof(os_access_obj_t));
 	obj->access.kmod.smn_fd = -1;
 	obj->access.kmod.pm_table_fd = -1;
+	obj->access.kmod.raw_cmd_fd = -1;
 
 	/*
 	 * Only the SMN/mailbox interface is mandatory: that is what every
@@ -124,6 +125,11 @@ os_access_obj_t *init_os_access_obj_kmod() {
 		DBG("failed to open smn fd: %s\n", strerror(errno));
 		goto err_exit;
 	}
+
+	/* optional: atomic mailbox interface, serialised with the driver's own SMU use */
+	obj->access.kmod.raw_cmd_fd = open("/sys/kernel/ryzen_smu_drv/smu_raw_cmd", O_RDWR | O_CLOEXEC);
+	if (obj->access.kmod.raw_cmd_fd == -1)
+		DBG("smu_raw_cmd not available (%s), using SMN register path\n", strerror(errno));
 
 	if (obj->access.kmod.pm_table_size != 0) {
 		obj->access.kmod.pm_table_fd = open("/sys/kernel/ryzen_smu_drv/pm_table",
@@ -156,6 +162,9 @@ void free_os_access_obj_kmod(os_access_obj_t *obj) {
 	if (obj->access.kmod.pm_table_fd >= 0)
 		close(obj->access.kmod.pm_table_fd);
 
+	if (obj->access.kmod.raw_cmd_fd >= 0)
+		close(obj->access.kmod.raw_cmd_fd);
+
 	free(obj);
 }
 
@@ -164,21 +173,25 @@ uint32_t smn_reg_read_kmod(const os_access_obj_t *obj, const uint32_t addr) {
 
 	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
 		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		smn_io_set_error();
 		return 0;
 	}
 
 	if (write_full(obj->access.kmod.smn_fd, &addr, sizeof(addr)) != 0) {
 		DBG("%s: write error: %s\n", __func__, strerror(errno));
+		smn_io_set_error();
 		return 0;
 	}
 
 	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
 		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		smn_io_set_error();
 		return 0;
 	}
 
 	if (read_full(obj->access.kmod.smn_fd, &result, sizeof(result)) != 0) {
 		DBG("%s: read error: %s\n", __func__, strerror(errno));
+		smn_io_set_error();
 		return 0;
 	}
 
@@ -190,11 +203,13 @@ void smn_reg_write_kmod(const os_access_obj_t *obj, const uint32_t addr, const u
 
 	if (lseek(obj->access.kmod.smn_fd, 0, SEEK_SET) == (off_t)-1) {
 		DBG("%s: lseek error: %s\n", __func__, strerror(errno));
+		smn_io_set_error();
 		return;
 	}
 
 	if (write_full(obj->access.kmod.smn_fd, write_buffer, sizeof(write_buffer)) != 0) {
 		DBG("%s: error: %s\n", __func__, strerror(errno));
+		smn_io_set_error();
 	}
 }
 
@@ -229,4 +244,58 @@ int copy_pm_table_kmod(const os_access_obj_t *obj, void *buffer, const size_t si
 int compare_pm_table_kmod(RA_UNUSED const void *buffer, RA_UNUSED size_t size) {
 	DBG("internal error: compare_pm_table() should never be called if ryzen_smu is loaded\n");
 	return -1;
+}
+
+/* ryzen_smu SMU_Return_* values that don't exist in the SMU itself */
+#define RSMU_RET_CMD_TIMEOUT 0xFB
+
+int smu_raw_cmd_kmod(const os_access_obj_t *obj, const uint32_t msg, const uint32_t rep,
+		     const uint32_t arg_base, const uint32_t id, smu_service_args_t *args,
+		     uint32_t *response) {
+	const int fd = obj->access.kmod.raw_cmd_fd;
+	const uint32_t req[10] = { msg, rep, arg_base, id,
+				   args->arg0, args->arg1, args->arg2,
+				   args->arg3, args->arg4, args->arg5 };
+	uint32_t res[7];
+
+	if (fd < 0)
+		return -1;
+
+	if (lseek(fd, 0, SEEK_SET) == (off_t)-1 || write_full(fd, req, sizeof(req)) != 0) {
+		if (errno == EINVAL) {
+			/* mailbox outside the driver's allowed window: use SMN path */
+			DBG("%s: driver rejected mailbox 0x%x, falling back\n", __func__, msg);
+			return -1;
+		}
+		DBG("%s: write error: %s\n", __func__, strerror(errno));
+		*response = REP_MSG_Failed;
+		return 0; /* may or may not have executed: never retry blindly */
+	}
+
+	if (lseek(fd, 0, SEEK_SET) == (off_t)-1 || read_full(fd, res, sizeof(res)) != 0) {
+		DBG("%s: read error: %s\n", __func__, strerror(errno));
+		/* EAGAIN: another process overwrote the result slot */
+		*response = errno == EAGAIN ? REP_MSG_CmdRejectedBusy : REP_MSG_Failed;
+		return 0;
+	}
+
+	switch (res[0]) {
+	case REP_MSG_OK:
+		args->arg0 = res[1]; args->arg1 = res[2]; args->arg2 = res[3];
+		args->arg3 = res[4]; args->arg4 = res[5]; args->arg5 = res[6];
+		/* fall through */
+	case REP_MSG_Failed:
+	case REP_MSG_UnknownCmd:
+	case REP_MSG_CmdRejectedPrereq:
+	case REP_MSG_CmdRejectedBusy:
+		*response = res[0];
+		break;
+	case RSMU_RET_CMD_TIMEOUT:
+		*response = REP_MSG_Timeout;
+		break;
+	default: /* PCI failure / invalid argument inside the driver */
+		*response = REP_MSG_Failed;
+		break;
+	}
+	return 0;
 }

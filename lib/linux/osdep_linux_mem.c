@@ -152,13 +152,15 @@ void free_os_access_obj_mem(os_access_obj_t *obj) {
 }
 
 uint32_t smn_reg_read_mem(const os_access_obj_t *obj, const uint32_t addr) {
-	pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_ADDR_ADDR, addr & ~(uint32_t)0x3);
+	if (!pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_ADDR_ADDR, addr & ~(uint32_t)0x3))
+		smn_io_set_error();
 	return pci_read_long(obj->access.mem.pci_dev, NB_PCI_REG_DATA_ADDR);
 }
 
 void smn_reg_write_mem(const os_access_obj_t *obj, const uint32_t addr, const uint32_t data) {
-	pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_ADDR_ADDR, addr);
-	pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_DATA_ADDR, data);
+	if (!pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_ADDR_ADDR, addr) ||
+	    !pci_write_long(obj->access.mem.pci_dev, NB_PCI_REG_DATA_ADDR, data))
+		smn_io_set_error();
 }
 
 int copy_pm_table_mem(RA_UNUSED const os_access_obj_t *obj, void *buffer, const size_t size) {

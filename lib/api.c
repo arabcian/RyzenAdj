@@ -13,7 +13,7 @@
 #endif
 
 
-EXP ryzen_access CALL init_ryzenadj() {
+EXP ryzen_access CALL init_ryzenadj(void) {
 	const enum ryzen_family family = cpuid_get_family();
 	ryzen_access ry;
 
@@ -88,8 +88,10 @@ EXP int get_bios_if_ver(ryzen_access ry)
 		return ry->bios_if_ver;
 
 	smu_service_args_t args = {0, 0, 0, 0, 0, 0};
-	smu_service_req(ry->mp1_smu, 0x3, &args);
-	ry->bios_if_ver = args.arg0;
+	/* on timeout/IO failure args are not (reliably) read back: don't cache them */
+	if (smu_service_req(ry->mp1_smu, 0x3, &args) != REP_MSG_OK)
+		return 0;
+	ry->bios_if_ver = (int)args.arg0;
 	return ry->bios_if_ver;
 }
 
